@@ -52,7 +52,8 @@ Options:
   --sync-yalc-resolutions  Before each first yarn, merge package.json resolutions where needed: only for
                          publish-plan packages that are declared deps of the target package.json (at the
                          workspace root, unions deps from packages/*) and not from the same repo (workspace
-                         links). Uses file:.yalc/<name> to fix nested yalc paths.
+                         links). Then run yalc add for those same names at the yarn cwd (e.g. repo root when
+                         installDir is .) so .yalc exists where file:.yalc/<name> resolves. Fixes nested yalc.
   --config <path>        Config file path. Default: yalc.yml
   --help                 Show help.
 
@@ -542,14 +543,17 @@ function syncYalcResolutionsIntoPackageJson(ctx, packageDir, publishSetNames) {
 }
 
 /**
- * Insert sync-resolutions steps before the first yarn install at each distinct cwd.
- * Syncs monorepo root (workspace root) and the install package when yarn runs in a workspace package.
+ * Insert sync-resolutions steps and matching `yalc add` at the yarn cwd before the first yarn at each cwd.
+ * Root-level yalc add is required when yarn runs at the repo root (e.g. installDir: .) so file:.yalc/<name>
+ * from resolutions points at materialized packages under that cwd's .yalc.
+ *
  * @param {Array<{ type: string, phase: number, cwd: string, cmd: string, shell?: boolean }>} commands
  * @param {string[]} publishSet
  * @param {{ syncYalcResolutions?: boolean }} args
+ * @param {{ config: object, baseDir: string }} ctx
  * @returns {typeof commands}
  */
-function injectResolutionsSteps(commands, publishSet, args) {
+function injectResolutionsSteps(commands, publishSet, args, ctx) {
   if (!args.syncYalcResolutions || publishSet.length === 0) {
     return commands;
   }
@@ -562,8 +566,14 @@ function injectResolutionsSteps(commands, publishSet, args) {
       c.cmd === 'yarn' &&
       !seenInstallCwd.has(c.cwd)
     ) {
+      const installAbs = path.resolve(c.cwd);
       const dirs = collectDirsToSyncYalcResolutions(c.cwd);
-      if (dirs.length) {
+      const names = getPublishSetNamesForYalcResolutions(
+        ctx,
+        installAbs,
+        publishSet,
+      );
+      if (dirs.length || names.length) {
         seenInstallCwd.add(c.cwd);
         for (const dir of dirs) {
           const absDir = path.resolve(dir);
@@ -576,6 +586,15 @@ function injectResolutionsSteps(commands, publishSet, args) {
             phase: c.phase ?? 0,
             cwd: absDir,
             cmd: `merge scoped yalc resolutions (from publish plan of ${publishSet.length} package(s))`,
+          });
+        }
+        for (const dep of names) {
+          out.push({
+            type: 'link',
+            phase: c.phase ?? 0,
+            cwd: installAbs,
+            cmd: `yalc add ${dep}`,
+            shell: true,
           });
         }
       }
@@ -1571,7 +1590,7 @@ function applyCommand(args) {
     impactReports,
     args,
   );
-  commands = injectResolutionsSteps(commands, plan.publishSet, args);
+  commands = injectResolutionsSteps(commands, plan.publishSet, args, ctx);
   printCommandList(commands, args);
 
   if (args.dryRun) {
