@@ -49,6 +49,10 @@ Options:
   --stage                git add package.json yalc.lock .yalc after yalc operations.
   --show-changelog       Print changelog excerpt for risky updates (with dry-run, risky rows only).
   --show-shell-preview   After the command list, print (cd <cwd> && <cmd>) lines (off by default).
+  --sync-yalc-resolutions  Before each first yarn, merge package.json resolutions where needed: only for
+                         publish-plan packages that are declared deps of the target package.json (at the
+                         workspace root, unions deps from packages/*) and not from the same repo (workspace
+                         links). Uses file:.yalc/<name> to fix nested yalc paths.
   --config <path>        Config file path. Default: yalc.yml
   --help                 Show help.
 
@@ -79,6 +83,7 @@ function parseArgs(argv) {
     stage: false,
     showChangelog: false,
     showShellPreview: false,
+    syncYalcResolutions: false,
     config: DEFAULT_CONFIG,
   };
 
@@ -101,6 +106,10 @@ function parseArgs(argv) {
     }
     if (arg === '--show-shell-preview') {
       args.showShellPreview = true;
+      continue;
+    }
+    if (arg === '--sync-yalc-resolutions') {
+      args.syncYalcResolutions = true;
       continue;
     }
     if (arg === '--changed') {
@@ -222,6 +231,30 @@ function resolveRepoPath(ctx, repoName) {
 }
 
 /**
+ * Longest matching repo root in config that contains `absDir`.
+ *
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {string} absDir
+ * @returns {string | null}
+ */
+function findRepoKeyForPath(ctx, absDir) {
+  const normalized = path.resolve(absDir);
+  let bestKey = null;
+  let bestLen = -1;
+  for (const repoKey of Object.keys(ctx.config.repos)) {
+    const root = resolveRepoPath(ctx, repoKey);
+    const r = path.resolve(root);
+    if (normalized === r || normalized.startsWith(`${r}${path.sep}`)) {
+      if (r.length > bestLen) {
+        bestLen = r.length;
+        bestKey = repoKey;
+      }
+    }
+  }
+  return bestKey;
+}
+
+/**
  * First consumer block whose `repo` key matches (e.g. `snap` in `repo: snap`).
  *
  * @param {{ config: object }} ctx
@@ -306,6 +339,250 @@ function readJson(filePath) {
   } catch {
     return null;
   }
+}
+
+/**
+ * Quote a path for bash `cd` / one-liners (unquoted when safe).
+ * @param {string} p
+ * @returns {string}
+ */
+function shellQuotePath(p) {
+  const s = String(p);
+  if (/^[a-zA-Z0-9/_.:@+-]+$/.test(s)) {
+    return s;
+  }
+  return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * One-line bash equivalent for (cd cwd && cmd).
+ * @param {string} cwd
+ * @param {string} cmd
+ * @param {boolean} shell
+ * @returns {string}
+ */
+function formatBashOneLiner(cwd, cmd, shell) {
+  const q = shellQuotePath(cwd);
+  if (shell) {
+    return `(cd ${q} && (${cmd}))`;
+  }
+  return `(cd ${q} && ${cmd})`;
+}
+
+/**
+ * Walk up from startDir to find a directory whose package.json defines `workspaces`.
+ * @param {string} startDir
+ * @returns {string | null}
+ */
+function findMonorepoWorkspaceRoot(startDir) {
+  let cur = path.resolve(startDir);
+  for (;;) {
+    const pkgPath = path.join(cur, 'package.json');
+    const pkg = readJson(pkgPath);
+    if (pkg?.workspaces) {
+      return cur;
+    }
+    const parent = path.dirname(cur);
+    if (parent === cur) {
+      break;
+    }
+    cur = parent;
+  }
+  return null;
+}
+
+/**
+ * Directories that should receive flat `file:.yalc/<name>` resolutions for a given yarn cwd:
+ * the monorepo root (workspace root) and, when yarn runs inside a workspace package, that package.
+ * @param {string} installCwd
+ * @returns {string[]}
+ */
+function collectDirsToSyncYalcResolutions(installCwd) {
+  const abs = path.resolve(installCwd);
+  const root = findMonorepoWorkspaceRoot(abs);
+  const out = [];
+  if (root) {
+    out.push(root);
+  }
+  if (root && abs !== root && fs.existsSync(path.join(abs, 'package.json'))) {
+    out.push(abs);
+  } else if (!root) {
+    const pkg = readJson(path.join(abs, 'package.json'));
+    if (pkg?.workspaces) {
+      out.push(abs);
+    }
+  }
+  return out;
+}
+
+/**
+ * Declared dependency names relevant for resolution scoping: this package.json, or at the workspace
+ * root the union of root plus each direct child under packages/ (package.json per folder).
+ *
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {string} packageDir
+ * @returns {Set<string>}
+ */
+function getDeclaredDepNamesForResolutionScope(ctx, packageDir) {
+  const abs = path.resolve(packageDir);
+  const workspaceRoot = findMonorepoWorkspaceRoot(abs);
+  const ownerRepo = findRepoKeyForPath(ctx, abs);
+  const repoRoot = ownerRepo ? resolveRepoPath(ctx, ownerRepo) : null;
+
+  const rootPkgPath = path.join(abs, 'package.json');
+  const rootPkg = readJson(rootPkgPath);
+  const declared = new Set();
+
+  if (!rootPkg) {
+    return declared;
+  }
+
+  const isWorkspaceRoot =
+    workspaceRoot && path.resolve(abs) === path.resolve(workspaceRoot);
+
+  if (
+    isWorkspaceRoot &&
+    repoRoot &&
+    path.resolve(workspaceRoot) === path.resolve(repoRoot)
+  ) {
+    for (const k of getDeclaredDepsWithSources(rootPkg).keys()) {
+      declared.add(k);
+    }
+    const packagesDir = path.join(repoRoot, 'packages');
+    if (fs.existsSync(packagesDir)) {
+      for (const ent of fs.readdirSync(packagesDir, { withFileTypes: true })) {
+        if (!ent.isDirectory()) {
+          continue;
+        }
+        const pj = path.join(packagesDir, ent.name, 'package.json');
+        const j = readJson(pj);
+        if (j) {
+          for (const k of getDeclaredDepsWithSources(j).keys()) {
+            declared.add(k);
+          }
+        }
+      }
+    }
+  } else {
+    for (const k of getDeclaredDepsWithSources(rootPkg).keys()) {
+      declared.add(k);
+    }
+  }
+
+  return declared;
+}
+
+/**
+ * Subset of publish-plan names that need a flat file:.yalc resolution here: declared dependency of this
+ * scope, managed in config, and not the same repo (those stay workspace-linked).
+ *
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {string} packageDir
+ * @param {string[]} publishSetNames
+ * @returns {string[]}
+ */
+function getPublishSetNamesForYalcResolutions(ctx, packageDir, publishSetNames) {
+  const declared = getDeclaredDepNamesForResolutionScope(ctx, packageDir);
+  const ownerRepo = findRepoKeyForPath(ctx, packageDir);
+  const out = [];
+
+  for (const name of publishSetNames) {
+    if (!declared.has(name)) {
+      continue;
+    }
+    const meta = ctx.config.packages[name];
+    if (!meta) {
+      continue;
+    }
+    if (ownerRepo && meta.repo === ownerRepo) {
+      continue;
+    }
+    out.push(name);
+  }
+  return out;
+}
+
+/**
+ * Merge file:.yalc/<name> into package.json resolutions only for scoped names; remove stale yalc entries
+ * for other publish-plan packages. Prevents nested file:.yalc/.../.yalc/... paths without bloating
+ * resolutions with unrelated or same-repo packages.
+ *
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {string} packageDir
+ * @param {string[]} publishSetNames
+ */
+function syncYalcResolutionsIntoPackageJson(ctx, packageDir, publishSetNames) {
+  const pkgPath = path.join(packageDir, 'package.json');
+  const pkg = readJson(pkgPath);
+  if (!pkg) {
+    return;
+  }
+
+  const filtered = new Set(
+    getPublishSetNamesForYalcResolutions(ctx, packageDir, publishSetNames),
+  );
+  const resolutions = { ...(pkg.resolutions ?? {}) };
+
+  for (const name of publishSetNames) {
+    const flat = `file:.yalc/${name}`;
+    if (resolutions[name] === flat && !filtered.has(name)) {
+      delete resolutions[name];
+    }
+  }
+  for (const name of filtered) {
+    resolutions[name] = `file:.yalc/${name}`;
+  }
+
+  if (Object.keys(resolutions).length === 0) {
+    delete pkg.resolutions;
+  } else {
+    pkg.resolutions = resolutions;
+  }
+  fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+}
+
+/**
+ * Insert sync-resolutions steps before the first yarn install at each distinct cwd.
+ * Syncs monorepo root (workspace root) and the install package when yarn runs in a workspace package.
+ * @param {Array<{ type: string, phase: number, cwd: string, cmd: string, shell?: boolean }>} commands
+ * @param {string[]} publishSet
+ * @param {{ syncYalcResolutions?: boolean }} args
+ * @returns {typeof commands}
+ */
+function injectResolutionsSteps(commands, publishSet, args) {
+  if (!args.syncYalcResolutions || publishSet.length === 0) {
+    return commands;
+  }
+  const seenInstallCwd = new Set();
+  const seenSyncedDirs = new Set();
+  const out = [];
+  for (const c of commands) {
+    if (
+      c.type === 'install' &&
+      c.cmd === 'yarn' &&
+      !seenInstallCwd.has(c.cwd)
+    ) {
+      const dirs = collectDirsToSyncYalcResolutions(c.cwd);
+      if (dirs.length) {
+        seenInstallCwd.add(c.cwd);
+        for (const dir of dirs) {
+          const absDir = path.resolve(dir);
+          if (seenSyncedDirs.has(absDir)) {
+            continue;
+          }
+          seenSyncedDirs.add(absDir);
+          out.push({
+            type: 'sync-resolutions',
+            phase: c.phase ?? 0,
+            cwd: absDir,
+            cmd: `merge scoped yalc resolutions (from publish plan of ${publishSet.length} package(s))`,
+          });
+        }
+      }
+    }
+    out.push(c);
+  }
+  return out;
 }
 
 function readPackageJson(dir) {
@@ -1138,14 +1415,6 @@ function planLinkCommands(ctx, consumer, impacts, options) {
   return commands;
 }
 
-function shellQuotePath(p) {
-  const s = String(p);
-  if (/^[a-zA-Z0-9/_.:@+-]+$/.test(s)) {
-    return s;
-  }
-  return `'${s.replace(/'/g, `'\\''`)}'`;
-}
-
 /**
  * @param {{ type: string, phase?: number, cwd: string, cmd: string, shell?: boolean }[]} commands
  * @param {{ showShellPreview?: boolean }} args
@@ -1166,6 +1435,12 @@ function printCommandList(commands, args) {
   if (args.showShellPreview) {
     subSection('Shell-friendly preview');
     for (const c of commands) {
+      if (c.type === 'sync-resolutions') {
+        info(
+          `# ${c.cwd}: ${c.cmd} (yalc-manager writes package.json resolutions; no shell step)`,
+        );
+        continue;
+      }
       const q = shellQuotePath(c.cwd);
       if (c.shell) {
         info(`(cd ${q} && (${c.cmd}))`);
@@ -1179,12 +1454,33 @@ function printCommandList(commands, args) {
 /**
  * @param {{ type: string, cwd: string, cmd: string, shell?: boolean }[]} commands
  * @param {boolean} dryRun
+ * @param {{ publishSet?: string[], ctx?: object }} [options]
  */
-function executeCommands(commands, dryRun) {
-  for (const c of commands) {
+function executeCommands(commands, dryRun, options = {}) {
+  const publishSet = options.publishSet ?? [];
+  const { ctx } = options;
+  const total = commands.length;
+  for (let i = 0; i < commands.length; i += 1) {
+    const c = commands[i];
+    const commandNumber = i + 1;
+    if (c.type === 'sync-resolutions') {
+      if (dryRun) {
+        continue;
+      }
+      if (!ctx) {
+        fail('Internal error: ctx is required for sync-yalc-resolutions');
+      }
+      syncYalcResolutionsIntoPackageJson(ctx, c.cwd, publishSet);
+      continue;
+    }
     const res = run(c.cmd, c.cwd, { dryRun, shell: c.shell === true });
     if (!res.ok) {
-      fail(`Command failed [${c.type}]: ${c.cmd}`);
+      const bash = formatBashOneLiner(c.cwd, c.cmd, c.shell === true);
+      console.error('\nERROR: Command failed.');
+      console.error(`  command: ${commandNumber} of ${total}`);
+      console.error(`  ${bash}`);
+      console.error(`  exit code: ${res.code}`);
+      fail(`Command ${commandNumber} failed [${c.type}]: ${c.cmd}`);
     }
   }
 }
@@ -1267,7 +1563,7 @@ function applyCommand(args) {
   printPlan(plan, consumers, args, phase1Packages, phase2Packages);
   printImpactReport(ctx, impactReports, args);
 
-  const commands = buildCommandPlan(
+  let commands = buildCommandPlan(
     ctx,
     plan,
     phase1Packages,
@@ -1275,6 +1571,7 @@ function applyCommand(args) {
     impactReports,
     args,
   );
+  commands = injectResolutionsSteps(commands, plan.publishSet, args);
   printCommandList(commands, args);
 
   if (args.dryRun) {
@@ -1283,7 +1580,7 @@ function applyCommand(args) {
     return;
   }
 
-  executeCommands(commands, false);
+  executeCommands(commands, false, { publishSet: plan.publishSet, ctx });
 
   section('Done');
 }
