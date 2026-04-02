@@ -1003,6 +1003,23 @@ function printImpactReport(ctx, impactReports, args) {
  * @param {string[]} fullOrder
  * @param {Map<string, number>} fullOrderIndex
  */
+/**
+ * Managed deps in the same monorepo (same `repo` key in config) are already workspace-linked;
+ * do not run yalc for them.
+ *
+ * @param {{ config: object }} ctx
+ * @param {string} ownerPkgName
+ * @param {string} depPkgName
+ */
+function isSameRepoManagedDep(ctx, ownerPkgName, depPkgName) {
+  const owner = ctx.config.packages[ownerPkgName];
+  const dep = ctx.config.packages[depPkgName];
+  if (!owner || !dep) {
+    return false;
+  }
+  return owner.repo === dep.repo;
+}
+
 function getRelinkDepsOrdered(ctx, pkgName, publishSet, fullOrder, fullOrderIndex) {
   const idx = fullOrderIndex.get(pkgName);
   if (idx === undefined) {
@@ -1013,7 +1030,9 @@ function getRelinkDepsOrdered(ctx, pkgName, publishSet, fullOrder, fullOrderInde
   const declared = getDeclaredDepsWithSources(json);
   const out = [];
   for (const name of declared.keys()) {
-    if (ctx.config.packages[name] && publishSet.has(name) && prior.has(name)) {
+    if (!ctx.config.packages[name]) continue;
+    if (isSameRepoManagedDep(ctx, pkgName, name)) continue;
+    if (publishSet.has(name) && prior.has(name)) {
       out.push(name);
     }
   }
@@ -1070,21 +1089,31 @@ function planManagedPackageCommands(
 }
 
 /**
+ * @param {{ config: object, baseDir: string }} ctx
  * @param {{ group: string, dir: string, absoluteDir: string, installCwd: string }} consumer
  * @param {{ pkgName: string }[]} impacts
  * @param {{ stage: boolean }} options
  * @returns {{ type: string, phase: number, cwd: string, cmd: string, shell?: boolean }[]}
  */
-function planLinkCommands(consumer, impacts, options) {
+function planLinkCommands(ctx, consumer, impacts, options) {
   if (!impacts.length) {
     return [];
   }
 
+  const consumerRepoKey = ctx.config.consumers[consumer.group]?.repo;
   const { absoluteDir, installCwd } = consumer;
   const { stage } = options;
   const commands = [];
 
   for (const impact of impacts) {
+    const depMeta = ctx.config.packages[impact.pkgName];
+    if (
+      consumerRepoKey != null &&
+      depMeta &&
+      depMeta.repo === consumerRepoKey
+    ) {
+      continue;
+    }
     const dep = impact.pkgName;
     commands.push({
       type: 'link',
@@ -1200,7 +1229,9 @@ function buildCommandPlan(ctx, plan, phase1Packages, phase2Packages, impactRepor
       continue;
     }
     commands.push(
-      ...planLinkCommands(report.consumer, report.impacts, { stage: args.stage }),
+      ...planLinkCommands(ctx, report.consumer, report.impacts, {
+        stage: args.stage,
+      }),
     );
   }
 
