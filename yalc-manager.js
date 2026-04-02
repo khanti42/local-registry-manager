@@ -47,7 +47,8 @@ Options:
   --scope <csv>          Optional. Consumer groups to sync. Example: core,snap,extension
   --dry-run              Print the plan and commands without executing.
   --stage                git add package.json yalc.lock .yalc after yalc operations.
-  --show-changelog       Print changelog excerpt for risky updates and always in dry-run when risky.
+  --show-changelog       Print changelog excerpt for risky updates (with dry-run, risky rows only).
+  --show-shell-preview   After the command list, print (cd <cwd> && <cmd>) lines (off by default).
   --config <path>        Config file path. Default: yalc.yml
   --help                 Show help.
 
@@ -77,6 +78,7 @@ function parseArgs(argv) {
     dryRun: false,
     stage: false,
     showChangelog: false,
+    showShellPreview: false,
     config: DEFAULT_CONFIG,
   };
 
@@ -95,6 +97,10 @@ function parseArgs(argv) {
     }
     if (arg === '--show-changelog') {
       args.showChangelog = true;
+      continue;
+    }
+    if (arg === '--show-shell-preview') {
+      args.showShellPreview = true;
       continue;
     }
     if (arg === '--changed') {
@@ -893,6 +899,46 @@ function printPlan(plan, consumers, args, phase1Packages, phase2Packages) {
   }
 }
 
+const IMPACT_COL_WIDTHS = [40, 28, 25, 14, 10, 8];
+const IMPACT_EXCERPT_MAX_LINES = 6;
+const IMPACT_EXCERPT_MAX_CHARS = 400;
+
+function truncateCell(str, max) {
+  const s = String(str);
+  if (s.length <= max) return s;
+  return `${s.slice(0, Math.max(0, max - 3))}...`;
+}
+
+/**
+ * @param {{ mode: string, compatible: boolean | null }} semverInfo
+ */
+function formatOkColumn(semverInfo) {
+  if (semverInfo.mode === 'yalc') return 'yalc';
+  if (semverInfo.compatible === true) return 'yes';
+  if (semverInfo.compatible === false) return 'no';
+  return 'unknown';
+}
+
+function formatImpactTableRow(cols) {
+  const parts = cols.map((c, i) =>
+    truncateCell(String(c), IMPACT_COL_WIDTHS[i]).padEnd(IMPACT_COL_WIDTHS[i]),
+  );
+  info(`  ${parts.join('  ')}`);
+}
+
+function impactTableSeparator() {
+  info(`  ${IMPACT_COL_WIDTHS.map((w) => '-'.repeat(w)).join('  ')}`);
+}
+
+function capChangelogExcerpt(text) {
+  const lines = text.split(/\r?\n/).slice(0, IMPACT_EXCERPT_MAX_LINES);
+  let out = lines.join('\n');
+  if (out.length > IMPACT_EXCERPT_MAX_CHARS) {
+    out = `${out.slice(0, IMPACT_EXCERPT_MAX_CHARS)}...`;
+  }
+  return out;
+}
+
 function printImpactReport(ctx, impactReports, args) {
   section('Consumer impact');
 
@@ -900,55 +946,50 @@ function printImpactReport(ctx, impactReports, args) {
     const label = `${report.consumer.group}:${report.consumer.dir}`;
 
     if (!report.exists) {
-      info(`\n- ${label}`);
-      info(`  no package.json`);
+      info(`\n${label}`);
+      info('  no package.json');
       continue;
     }
 
     if (!report.impacts.length) {
-      info(`\n- ${label}`);
-      info(`  no relevant managed deps declared`);
+      info(`\n${label}`);
+      info('  no relevant managed deps declared');
       continue;
     }
 
-    info(`\n- ${label}`);
-    info(`  dir (yalc/link): ${report.consumer.absoluteDir}`);
-    if (report.consumer.installCwd !== report.consumer.absoluteDir) {
-      info(`  yarn cwd: ${report.consumer.installCwd}`);
-    }
+    info(`\n${label}`);
+
+    formatImpactTableRow([
+      'package',
+      'reason',
+      'declared',
+      'local',
+      'change',
+      'ok',
+    ]);
+    impactTableSeparator();
 
     for (const impact of report.impacts) {
-      const compat =
-        impact.semverInfo.compatible === true
-          ? 'yes'
-          : impact.semverInfo.compatible === false
-            ? 'no'
-            : 'unknown';
+      const reason = impact.reasons.join('; ');
+      const declared = String(impact.declaredRange).includes('yalc')
+        ? 'yalc'
+        : `${impact.declaredRange} (${impact.declaredSource})`;
+      const local = impact.localVersion ?? '(none)';
+      const change = impact.semverInfo.changeType;
+      const ok = formatOkColumn(impact.semverInfo);
 
-      info(`  * ${impact.pkgName}`);
-      info(`    reason: ${impact.reasons.join('; ')}`);
-      info(`    declared (${impact.declaredSource}): ${impact.declaredRange}`);
-      info(`    local: ${impact.localVersion ?? '(no version found)'}`);
-      info(`    change: ${impact.semverInfo.changeType}`);
-      info(`    satisfies declared range: ${compat}`);
+      formatImpactTableRow([
+        impact.pkgName,
+        reason,
+        declared,
+        local,
+        change,
+        ok,
+      ]);
 
-      const shouldShowChangelog = args.showChangelog || (args.dryRun && impact.risky);
-
-      if (shouldShowChangelog) {
-        const changelog = getChangelogInfo(ctx, impact.pkgName);
-        if (changelog) {
-          info(`    changelog: ${changelog.filePath}`);
-          if (changelog.snippet) {
-            const indented = changelog.snippet
-              .split('\n')
-              .map((line) => `      ${line}`)
-              .join('\n');
-            info(`    excerpt:\n${indented}`);
-          }
-        } else if (impact.risky) {
-          info(`    changelog: not found`);
-        }
-      }
+      const shouldShowChangelog =
+        impact.risky && (args.showChangelog || args.dryRun);
+      
     }
   }
 }
@@ -1049,7 +1090,7 @@ function planLinkCommands(consumer, impacts, options) {
       type: 'link',
       phase: 3,
       cwd: absoluteDir,
-      cmd: `yalc update ${dep} || yalc add ${dep}`,
+      cmd: `yalc add ${dep}`,
       shell: true,
     });
   }
@@ -1078,46 +1119,30 @@ function shellQuotePath(p) {
 
 /**
  * @param {{ type: string, phase?: number, cwd: string, cmd: string, shell?: boolean }[]} commands
+ * @param {{ showShellPreview?: boolean }} args
  */
-function printCommandList(commands) {
+function printCommandList(commands, args) {
   section('Command list');
   if (!commands.length) {
     info('(no commands)');
     return;
   }
 
-  let currentPhase = null;
-  let n = 0;
   for (let i = 0; i < commands.length; i += 1) {
     const c = commands[i];
     const phase = c.phase ?? 0;
-    if (phase !== currentPhase) {
-      currentPhase = phase;
-      const label =
-        phase === 1
-          ? 'Phase 1 (upstream + changed)'
-          : phase === 2
-            ? 'Phase 2 (downstream managed)'
-            : phase === 3
-              ? 'Phase 3 (consumer-only)'
-              : `Phase ${phase}`;
-      subSection(label);
-    }
-    n += 1;
-    info(`${n}. [phase ${phase}] [${c.type}] cwd=${c.cwd}`);
-    info(`   cmd: ${c.cmd}`);
-    if (c.shell) {
-      info('   shell: true');
-    }
+    info(`${i + 1}. [phase ${phase}] ${c.cwd} :: ${c.cmd}`);
   }
 
-  subSection('Shell-friendly (cd <cwd> && <cmd>)');
-  for (const c of commands) {
-    const q = shellQuotePath(c.cwd);
-    if (c.shell) {
-      info(`(cd ${q} && (${c.cmd}))`);
-    } else {
-      info(`(cd ${q} && ${c.cmd})`);
+  if (args.showShellPreview) {
+    subSection('Shell-friendly preview');
+    for (const c of commands) {
+      const q = shellQuotePath(c.cwd);
+      if (c.shell) {
+        info(`(cd ${q} && (${c.cmd}))`);
+      } else {
+        info(`(cd ${q} && ${c.cmd})`);
+      }
     }
   }
 }
@@ -1219,7 +1244,7 @@ function applyCommand(args) {
     impactReports,
     args,
   );
-  printCommandList(commands);
+  printCommandList(commands, args);
 
   if (args.dryRun) {
     section('Done');
