@@ -1054,7 +1054,7 @@ function planManagedPackageCommands(
       type: 'link',
       phase,
       cwd: publishDir,
-      cmd: `yalc update ${dep} || yalc add ${dep}`,
+      cmd: `yalc add ${dep}`,
       shell: true,
     });
   }

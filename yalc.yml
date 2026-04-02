@@ -83,10 +83,14 @@ consumers:
     installDir: .
     dirs:
       - packages/accounts-controller
+      - packages/accounts-tree-controller
+      - packages/assets-controller
       - packages/bridge-controller
-      - packages/multichain-account-service
+      - packages/chain-agnostic-permission
       - packages/multichain-network-controller
+      - packages/multichain-transactions-controller
       - packages/network-enablement-controller
+      - packages/multichain-account-service
 
   accounts:
     repo: accounts
