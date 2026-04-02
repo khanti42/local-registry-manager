@@ -1,0 +1,108 @@
+repos:
+  core: ../core
+  utils: ../utils
+  accounts: ../accounts
+  snap: ../snap-stellar-wallet
+  extension: ../metamask-extension
+
+packages:
+  "@metamask/utils":
+    repo: utils
+    build: yarn build
+    publishDir: .
+
+  "@metamask/accounts-controller":
+    repo: core
+    build: yarn workspace @metamask/accounts-controller build
+    publishDir: packages/accounts-controller
+    dependsOn:
+      - "@metamask/utils"
+
+  "@metamask/bridge-controller":
+    repo: core
+    build: yarn workspace @metamask/bridge-controller build
+    publishDir: packages/bridge-controller
+    dependsOn:
+      - "@metamask/utils"
+
+  "@metamask/multichain-account-service":
+    repo: core
+    build: yarn workspace @metamask/multichain-account-service build
+    publishDir: packages/multichain-account-service
+    dependsOn:
+      - "@metamask/utils"
+
+  "@metamask/multichain-network-controller":
+    repo: core
+    build: yarn workspace @metamask/multichain-network-controller build
+    publishDir: packages/multichain-network-controller
+    dependsOn:
+      - "@metamask/utils"
+
+  "@metamask/network-enablement-controller":
+    repo: core
+    build: yarn workspace @metamask/network-enablement-controller build
+    publishDir: packages/network-enablement-controller
+    dependsOn:
+      - "@metamask/utils"
+
+  "@metamask/eth-snap-keyring":
+    repo: accounts
+    build: yarn workspace @metamask/eth-snap-keyring build
+    publishDir: packages/keyring-snap-bridge
+    dependsOn:
+      - "@metamask/utils"
+
+  "@metamask/keyring-api":
+    repo: accounts
+    build: yarn workspace @metamask/keyring-api build
+    publishDir: packages/keyring-api
+    dependsOn:
+      - "@metamask/utils"
+
+  "@metamask/keyring-internal-api":
+    repo: accounts
+    build: yarn workspace @metamask/keyring-internal-api build
+    publishDir: packages/keyring-internal-api
+    dependsOn:
+      - "@metamask/utils"
+
+  "@metamask/stellar-wallet-snap":
+    repo: snap
+    build: yarn workspace @metamask/stellar-wallet-snap build
+    publishDir: packages/snap
+    dependsOn:
+      - "@metamask/utils"
+      - "@metamask/eth-snap-keyring"
+      - "@metamask/keyring-api"
+      - "@metamask/keyring-internal-api"
+
+consumers:
+  core:
+    repo: core
+    installDir: .
+    dirs:
+      - packages/accounts-controller
+      - packages/bridge-controller
+      - packages/multichain-account-service
+      - packages/multichain-network-controller
+      - packages/network-enablement-controller
+
+  accounts:
+    repo: accounts
+    installDir: .
+    dirs:
+      - packages/keyring-snap-bridge
+      - packages/keyring-api
+      - packages/keyring-internal-api
+
+  snap:
+    repo: snap
+    installDir: .
+    dirs:
+      - packages/snap
+
+  extension:
+    repo: extension
+    dirs:
+      - .

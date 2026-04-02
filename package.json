@@ -1,4 +1,13 @@
 {
   "name": "yalc-manager",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "js-yaml": "^4.1.0",
+    "semver": "^7.6.3"
+  },
+  "scripts": {
+    "yalc": "node yalc-manager.js"
+  },
   "packageManager": "yarn@4.6.0"
 }
