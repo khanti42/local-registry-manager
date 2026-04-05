@@ -35,6 +35,12 @@ function printHelp() {
   console.log(`
 Usage:
   node yalc-manager.js apply --changed <pkg1,pkg2,...> [options]
+  node yalc-manager.js clean [options]
+
+Commands:
+  apply                  Publish/link plan from --changed and config.
+  clean                  In all configured repo and consumer dirs: yalc remove for yalc-linked managed
+                         packages, remove nested .yalc symlinks created by --sync-yalc-resolutions.
 
 Options:
   --changed <csv>        Required. Managed packages you changed directly.
@@ -52,8 +58,12 @@ Options:
   --sync-yalc-resolutions  Before each first yarn, merge package.json resolutions where needed: publish-plan
                          packages that are direct managed deps of the target, plus transitive managed deps
                          via YAML dependsOn from those seeds (at workspace root, unions packages/). Excludes
-                         same-repo packages. Then yalc add those names at the yarn cwd when needed. Fixes
-                         nested yalc.
+                         same-repo packages. Uses Yarn selective parent/child keys from dependsOn when
+                         possible; then yalc add at the yarn cwd; optionally symlink nested package .yalc to
+                         the repo root .yalc so nested file:.yalc paths resolve.
+  --legacy-global-yalc-resolutions  With --sync-yalc-resolutions, use flat \"@scope/pkg\": file:.yalc/...
+                         only (no parent/child keys).
+  --no-symlink-nested-yalc  With --sync-yalc-resolutions, skip creating nested .yalc -> repo .yalc symlinks.
   --config <path>        Config file path. Default: yalc.yml
   --help                 Show help.
 
@@ -85,6 +95,8 @@ function parseArgs(argv) {
     showChangelog: false,
     showShellPreview: false,
     syncYalcResolutions: false,
+    legacyGlobalYalcResolutions: false,
+    symlinkNestedYalc: true,
     config: DEFAULT_CONFIG,
   };
 
@@ -111,6 +123,14 @@ function parseArgs(argv) {
     }
     if (arg === '--sync-yalc-resolutions') {
       args.syncYalcResolutions = true;
+      continue;
+    }
+    if (arg === '--legacy-global-yalc-resolutions') {
+      args.legacyGlobalYalcResolutions = true;
+      continue;
+    }
+    if (arg === '--no-symlink-nested-yalc') {
+      args.symlinkNestedYalc = false;
       continue;
     }
     if (arg === '--changed') {
@@ -556,34 +576,118 @@ function getPublishSetNamesForYalcResolutions(ctx, packageDir, publishSetNames) 
 }
 
 /**
- * Merge file:.yalc/<name> into package.json resolutions only for scoped names; remove stale yalc entries
- * for other publish-plan packages. Prevents nested file:.yalc/.../.yalc/... paths without bloating
- * resolutions with unrelated or same-repo packages.
+ * @param {Record<string, { dependsOn?: string[] }>} packages
+ * @returns {Map<string, Set<string>>}
+ */
+function buildParentsMap(packages) {
+  const parents = new Map();
+  for (const [pkgName, meta] of Object.entries(packages)) {
+    for (const dep of meta.dependsOn ?? []) {
+      if (!parents.has(dep)) {
+        parents.set(dep, new Set());
+      }
+      parents.get(dep).add(pkgName);
+    }
+  }
+  return parents;
+}
+
+/**
+ * Transitive managed closure from direct seeds (for parent/child resolution keys).
  *
  * @param {{ config: object, baseDir: string }} ctx
  * @param {string} packageDir
  * @param {string[]} publishSetNames
+ * @returns {Set<string>}
  */
-function syncYalcResolutionsIntoPackageJson(ctx, packageDir, publishSetNames) {
+function getPublishSetClosureForResolutions(ctx, packageDir, publishSetNames) {
+  const publishSet = new Set(publishSetNames);
+  const directManaged = getManagedDirectDepsDeclaredInScope(ctx, packageDir);
+  if (directManaged.size === 0) {
+    return new Set();
+  }
+  return expandNeedWithClosureDeps(
+    publishSet,
+    directManaged,
+    ctx.config.packages,
+  );
+}
+
+/**
+ * Yarn Classic selective resolutions: parent/child keys from YAML dependsOn when possible.
+ *
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {string} packageDir
+ * @param {string[]} publishSetNames
+ * @param {{ legacyGlobalYalcResolutions?: boolean }} args
+ * @returns {Map<string, string>}
+ */
+function buildYalcResolutionMap(ctx, packageDir, publishSetNames, args) {
+  const filtered = getPublishSetNamesForYalcResolutions(ctx, packageDir, publishSetNames);
+  const closure = getPublishSetClosureForResolutions(ctx, packageDir, publishSetNames);
+  const parentsMap = buildParentsMap(ctx.config.packages);
+  const entries = new Map();
+
+  if (args.legacyGlobalYalcResolutions) {
+    for (const dep of filtered) {
+      entries.set(dep, `file:.yalc/${dep}`);
+    }
+    return entries;
+  }
+
+  for (const dep of filtered) {
+    const flat = `file:.yalc/${dep}`;
+    const parents = parentsMap.get(dep);
+    let scoped = false;
+    if (parents && parents.size > 0) {
+      for (const parent of parents) {
+        if (!closure.has(parent)) {
+          continue;
+        }
+        entries.set(`${parent}/${dep}`, flat);
+        scoped = true;
+      }
+    }
+    if (!scoped) {
+      entries.set(dep, flat);
+    }
+  }
+  return entries;
+}
+
+/**
+ * Merge file:.yalc entries into package.json resolutions; strip prior yalc pins for this publish set.
+ *
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {string} packageDir
+ * @param {string[]} publishSetNames
+ * @param {{ legacyGlobalYalcResolutions?: boolean }} args
+ */
+function syncYalcResolutionsIntoPackageJson(ctx, packageDir, publishSetNames, args) {
   const pkgPath = path.join(packageDir, 'package.json');
   const pkg = readJson(pkgPath);
   if (!pkg) {
     return;
   }
 
-  const filtered = new Set(
-    getPublishSetNamesForYalcResolutions(ctx, packageDir, publishSetNames),
-  );
   const resolutions = { ...(pkg.resolutions ?? {}) };
 
   for (const name of publishSetNames) {
     const flat = `file:.yalc/${name}`;
-    if (resolutions[name] === flat && !filtered.has(name)) {
-      delete resolutions[name];
+    const keysToRemove = [];
+    for (const [k, v] of Object.entries(resolutions)) {
+      if (v === flat) {
+        keysToRemove.push(k);
+      }
+    }
+    for (const k of keysToRemove) {
+      delete resolutions[k];
     }
   }
-  for (const name of filtered) {
-    resolutions[name] = `file:.yalc/${name}`;
+
+  const map = buildYalcResolutionMap(ctx, packageDir, publishSetNames, args);
+  for (const [k, v] of map.entries()) {
+    resolutions[k] = v;
   }
 
   if (Object.keys(resolutions).length === 0) {
@@ -592,6 +696,157 @@ function syncYalcResolutionsIntoPackageJson(ctx, packageDir, publishSetNames) {
     pkg.resolutions = resolutions;
   }
   fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+}
+
+/**
+ * Symlink nestedDir/.yalc -> repoRoot/.yalc so nested file:.yalc/... resolves to the same store.
+ *
+ * @param {string} repoRoot
+ * @param {string} nestedDir
+ */
+function ensureNestedYalcSymlink(repoRoot, nestedDir) {
+  const target = path.join(repoRoot, '.yalc');
+  const linkPath = path.join(nestedDir, '.yalc');
+  if (!fs.existsSync(target)) {
+    info(`  skip symlink (no ${target})`);
+    return;
+  }
+  try {
+    const stat = fs.lstatSync(linkPath);
+    if (stat.isSymbolicLink()) {
+      const resolved = path.resolve(nestedDir, fs.readlinkSync(linkPath));
+      if (resolved === path.resolve(target)) {
+        return;
+      }
+      fs.unlinkSync(linkPath);
+    } else if (stat.isDirectory()) {
+      info(`  skip symlink (${linkPath} is a directory, not a symlink)`);
+      return;
+    }
+  } catch {
+    // linkPath missing
+  }
+  fs.symlinkSync(target, linkPath, 'dir');
+}
+
+/**
+ * Remove nested .yalc symlink if present (dev cleanup).
+ *
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {string} dir
+ */
+function removeNestedYalcSymlinkIfAny(ctx, dir) {
+  const repoRoot = findRepoKeyForPath(ctx, dir)
+    ? resolveRepoPath(ctx, findRepoKeyForPath(ctx, dir))
+    : null;
+  if (!repoRoot || path.resolve(dir) === path.resolve(repoRoot)) {
+    return;
+  }
+  const linkPath = path.join(dir, '.yalc');
+  try {
+    if (fs.lstatSync(linkPath).isSymbolicLink()) {
+      fs.unlinkSync(linkPath);
+    }
+  } catch {
+    // ignore
+  }
+}
+
+/**
+ * Managed package names that use `file:.yalc/...` in declared dependencies.
+ *
+ * @param {{ config: object }} ctx
+ * @param {object} pkgJson
+ * @returns {string[]}
+ */
+function getManagedYalcLinkedPackageNames(ctx, pkgJson) {
+  const declared = getDeclaredDepsWithSources(pkgJson);
+  const out = [];
+  for (const [name, { range }] of declared.entries()) {
+    if (isYalcFileSpecifier(range) && ctx.config.packages[name]) {
+      out.push(name);
+    }
+  }
+  out.sort((a, b) => a.localeCompare(b));
+  return out;
+}
+
+/**
+ * Remove resolution entries whose value is `file:.yalc/<managedName>` for any managed package name.
+ *
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {string} packageDir
+ */
+function stripYalcManagedResolutionsFromPackageJson(ctx, packageDir) {
+  const pkgPath = path.join(packageDir, 'package.json');
+  const pkg = readJson(pkgPath);
+  if (!pkg?.resolutions) {
+    return;
+  }
+  const managedNames = new Set(Object.keys(ctx.config.packages));
+  const resolutions = { ...pkg.resolutions };
+  let changed = false;
+  for (const [k, v] of Object.entries(resolutions)) {
+    if (typeof v !== 'string' || !isYalcFileSpecifier(v)) {
+      continue;
+    }
+    const rest = v.slice('file:.yalc/'.length);
+    if (managedNames.has(rest)) {
+      delete resolutions[k];
+      changed = true;
+    }
+  }
+  if (!changed) {
+    return;
+  }
+  if (Object.keys(resolutions).length === 0) {
+    delete pkg.resolutions;
+  } else {
+    pkg.resolutions = resolutions;
+  }
+  fs.writeFileSync(pkgPath, `${JSON.stringify(pkg, null, 2)}\n`, 'utf8');
+}
+
+/**
+ * Repo roots, consumer link/install dirs, and managed package publish dirs (deduped).
+ *
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {string[]} scope
+ * @returns {string[]}
+ */
+function collectAllCleanDirectories(ctx, scope) {
+  const seen = new Set();
+  const out = [];
+
+  for (const repoKey of Object.keys(ctx.config.repos)) {
+    const root = path.resolve(resolveRepoPath(ctx, repoKey));
+    if (!seen.has(root)) {
+      seen.add(root);
+      out.push(root);
+    }
+  }
+
+  const consumers = getConsumersToProcess(ctx, scope);
+  for (const c of consumers) {
+    for (const d of [c.absoluteDir, c.installCwd]) {
+      const abs = path.resolve(d);
+      if (!seen.has(abs)) {
+        seen.add(abs);
+        out.push(abs);
+      }
+    }
+  }
+
+  for (const meta of Object.values(ctx.config.packages)) {
+    const repoRoot = resolveRepoPath(ctx, meta.repo);
+    const dir = path.resolve(repoRoot, meta.publishDir);
+    if (!seen.has(dir)) {
+      seen.add(dir);
+      out.push(dir);
+    }
+  }
+
+  return out;
 }
 
 /**
@@ -611,6 +866,7 @@ function injectResolutionsSteps(commands, publishSet, args, ctx) {
   }
   const seenInstallCwd = new Set();
   const seenSyncedDirs = new Set();
+  const seenNestedSymlink = new Set();
   const out = [];
   for (const c of commands) {
     if (
@@ -648,6 +904,30 @@ function injectResolutionsSteps(commands, publishSet, args, ctx) {
             cmd: `yalc add ${dep}`,
             shell: true,
           });
+        }
+        if (args.symlinkNestedYalc) {
+          for (const dir of dirs) {
+            const absDir = path.resolve(dir);
+            const repoKey = findRepoKeyForPath(ctx, absDir);
+            if (!repoKey) {
+              continue;
+            }
+            const repoRoot = resolveRepoPath(ctx, repoKey);
+            if (path.resolve(absDir) === path.resolve(repoRoot)) {
+              continue;
+            }
+            if (seenNestedSymlink.has(absDir)) {
+              continue;
+            }
+            seenNestedSymlink.add(absDir);
+            out.push({
+              type: 'symlink-nested-yalc',
+              phase: c.phase ?? 0,
+              cwd: absDir,
+              repoRoot,
+              cmd: `symlink ${path.join(absDir, '.yalc')} -> ${path.join(repoRoot, '.yalc')}`,
+            });
+          }
         }
       }
     }
@@ -1512,6 +1792,19 @@ function printCommandList(commands, args) {
         );
         continue;
       }
+      if (c.type === 'symlink-nested-yalc') {
+        info(
+          `# ${c.cwd}: ${c.cmd} (yalc-manager creates symlink; no shell step)`,
+        );
+        continue;
+      }
+      if (
+        c.type === 'clean-unlink-nested' ||
+        c.type === 'clean-strip-resolutions'
+      ) {
+        info(`# ${c.cwd}: ${c.cmd} (yalc-manager; no shell step)`);
+        continue;
+      }
       const q = shellQuotePath(c.cwd);
       if (c.shell) {
         info(`(cd ${q} && (${c.cmd}))`);
@@ -1523,13 +1816,14 @@ function printCommandList(commands, args) {
 }
 
 /**
- * @param {{ type: string, cwd: string, cmd: string, shell?: boolean }[]} commands
+ * @param {{ type: string, cwd: string, cmd: string, shell?: boolean, repoRoot?: string }[]} commands
  * @param {boolean} dryRun
- * @param {{ publishSet?: string[], ctx?: object }} [options]
+ * @param {{ publishSet?: string[], ctx?: object, args?: { legacyGlobalYalcResolutions?: boolean } }} [options]
  */
 function executeCommands(commands, dryRun, options = {}) {
   const publishSet = options.publishSet ?? [];
   const { ctx } = options;
+  const cmdArgs = options.args ?? { legacyGlobalYalcResolutions: false };
   const total = commands.length;
   for (let i = 0; i < commands.length; i += 1) {
     const c = commands[i];
@@ -1541,7 +1835,40 @@ function executeCommands(commands, dryRun, options = {}) {
       if (!ctx) {
         fail('Internal error: ctx is required for sync-yalc-resolutions');
       }
-      syncYalcResolutionsIntoPackageJson(ctx, c.cwd, publishSet);
+      syncYalcResolutionsIntoPackageJson(ctx, c.cwd, publishSet, cmdArgs);
+      continue;
+    }
+    if (c.type === 'symlink-nested-yalc') {
+      if (dryRun) {
+        continue;
+      }
+      if (!ctx) {
+        fail('Internal error: ctx is required for symlink-nested-yalc');
+      }
+      if (!c.repoRoot) {
+        fail('Internal error: symlink-nested-yalc missing repoRoot');
+      }
+      ensureNestedYalcSymlink(c.repoRoot, c.cwd);
+      continue;
+    }
+    if (c.type === 'clean-unlink-nested') {
+      if (dryRun) {
+        continue;
+      }
+      if (!ctx) {
+        fail('Internal error: ctx is required for clean-unlink-nested');
+      }
+      removeNestedYalcSymlinkIfAny(ctx, c.cwd);
+      continue;
+    }
+    if (c.type === 'clean-strip-resolutions') {
+      if (dryRun) {
+        continue;
+      }
+      if (!ctx) {
+        fail('Internal error: ctx is required for clean-strip-resolutions');
+      }
+      stripYalcManagedResolutionsFromPackageJson(ctx, c.cwd);
       continue;
     }
     const res = run(c.cmd, c.cwd, { dryRun, shell: c.shell === true });
@@ -1651,8 +1978,68 @@ function applyCommand(args) {
     return;
   }
 
-  executeCommands(commands, false, { publishSet: plan.publishSet, ctx });
+  executeCommands(commands, false, { publishSet: plan.publishSet, ctx, args });
 
+  section('Done');
+}
+
+/**
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {string[]} dirs
+ * @returns {{ type: string, phase?: number, cwd: string, cmd: string, shell?: boolean }[]}
+ */
+function buildCleanCommands(ctx, dirs) {
+  const commands = [];
+  for (const dir of dirs) {
+    const pkgPath = path.join(dir, 'package.json');
+    if (!fs.existsSync(pkgPath)) {
+      continue;
+    }
+    const pkg = readJson(pkgPath);
+    if (!pkg) {
+      continue;
+    }
+    const names = getManagedYalcLinkedPackageNames(ctx, pkg);
+    commands.push({
+      type: 'clean-unlink-nested',
+      phase: 0,
+      cwd: dir,
+      cmd: 'remove nested .yalc symlink if any',
+    });
+    for (const name of names) {
+      commands.push({
+        type: 'link',
+        phase: 0,
+        cwd: dir,
+        cmd: `yalc remove ${name}`,
+        shell: true,
+      });
+    }
+    commands.push({
+      type: 'clean-strip-resolutions',
+      phase: 0,
+      cwd: dir,
+      cmd: 'strip yalc resolutions for managed packages',
+    });
+  }
+  return commands;
+}
+
+function cleanCommand(args) {
+  const ctx = loadConfig(args.config);
+  const dirs = collectAllCleanDirectories(ctx, args.scope);
+  section('Clean paths');
+  for (const d of dirs) {
+    info(d);
+  }
+  const commands = buildCleanCommands(ctx, dirs);
+  printCommandList(commands, args);
+  if (args.dryRun) {
+    section('Done');
+    info('Dry-run: no commands executed.');
+    return;
+  }
+  executeCommands(commands, false, { ctx, args });
   section('Done');
 }
 
@@ -1667,6 +2054,9 @@ function main() {
   switch (args.command) {
     case 'apply':
       applyCommand(args);
+      break;
+    case 'clean':
+      cleanCommand(args);
       break;
     default:
       fail(`Unknown command: ${args.command}`);
