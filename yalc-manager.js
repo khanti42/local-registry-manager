@@ -49,11 +49,11 @@ Options:
   --stage                git add package.json yalc.lock .yalc after yalc operations.
   --show-changelog       Print changelog excerpt for risky updates (with dry-run, risky rows only).
   --show-shell-preview   After the command list, print (cd <cwd> && <cmd>) lines (off by default).
-  --sync-yalc-resolutions  Before each first yarn, merge package.json resolutions where needed: only for
-                         publish-plan packages that are declared deps of the target package.json (at the
-                         workspace root, unions deps from packages/*) and not from the same repo (workspace
-                         links). Then run yalc add for those same names at the yarn cwd (e.g. repo root when
-                         installDir is .) so .yalc exists where file:.yalc/<name> resolves. Fixes nested yalc.
+  --sync-yalc-resolutions  Before each first yarn, merge package.json resolutions where needed: publish-plan
+                         packages that are direct managed deps of the target, plus transitive managed deps
+                         via YAML dependsOn from those seeds (at workspace root, unions packages/). Excludes
+                         same-repo packages. Then yalc add those names at the yarn cwd when needed. Fixes
+                         nested yalc.
   --config <path>        Config file path. Default: yalc.yml
   --help                 Show help.
 
@@ -411,14 +411,42 @@ function collectDirsToSyncYalcResolutions(installCwd) {
     const pkg = readJson(path.join(abs, 'package.json'));
     if (pkg?.workspaces) {
       out.push(abs);
+    } else if (pkg) {
+      out.push(abs);
     }
   }
   return out;
 }
 
 /**
- * Declared dependency names relevant for resolution scoping: this package.json, or at the workspace
- * root the union of root plus each direct child under packages/ (package.json per folder).
+ * Add dependency names from each packages/<name>/package.json under repoRoot.
+ *
+ * @param {string} repoRoot
+ * @param {Set<string>} declared
+ */
+function unionDepsFromRepoPackagesDir(repoRoot, declared) {
+  const packagesDir = path.join(repoRoot, 'packages');
+  if (!fs.existsSync(packagesDir)) {
+    return;
+  }
+  for (const ent of fs.readdirSync(packagesDir, { withFileTypes: true })) {
+    if (!ent.isDirectory()) {
+      continue;
+    }
+    const pj = path.join(packagesDir, ent.name, 'package.json');
+    const j = readJson(pj);
+    if (j) {
+      for (const k of getDeclaredDepsWithSources(j).keys()) {
+        declared.add(k);
+      }
+    }
+  }
+}
+
+/**
+ * Declared dependency names relevant for resolution scoping: this package.json, or at the repo root the
+ * union of root plus each direct child under packages/ (package.json per folder). Includes repos that use
+ * a packages/ layout but omit the `workspaces` field (e.g. some app repos).
  *
  * @param {{ config: object, baseDir: string }} ctx
  * @param {string} packageDir
@@ -438,32 +466,22 @@ function getDeclaredDepNamesForResolutionScope(ctx, packageDir) {
     return declared;
   }
 
-  const isWorkspaceRoot =
-    workspaceRoot && path.resolve(abs) === path.resolve(workspaceRoot);
+  const atRepoRoot = repoRoot && path.resolve(abs) === path.resolve(repoRoot);
+  const hasPackagesDir =
+    repoRoot && fs.existsSync(path.join(repoRoot, 'packages'));
+  const workspaceRootMatchesRepo =
+    workspaceRoot && path.resolve(workspaceRoot) === path.resolve(repoRoot);
 
-  if (
-    isWorkspaceRoot &&
-    repoRoot &&
-    path.resolve(workspaceRoot) === path.resolve(repoRoot)
-  ) {
+  const unionRootAndPackages =
+    atRepoRoot &&
+    hasPackagesDir &&
+    (workspaceRootMatchesRepo || !workspaceRoot);
+
+  if (unionRootAndPackages) {
     for (const k of getDeclaredDepsWithSources(rootPkg).keys()) {
       declared.add(k);
     }
-    const packagesDir = path.join(repoRoot, 'packages');
-    if (fs.existsSync(packagesDir)) {
-      for (const ent of fs.readdirSync(packagesDir, { withFileTypes: true })) {
-        if (!ent.isDirectory()) {
-          continue;
-        }
-        const pj = path.join(packagesDir, ent.name, 'package.json');
-        const j = readJson(pj);
-        if (j) {
-          for (const k of getDeclaredDepsWithSources(j).keys()) {
-            declared.add(k);
-          }
-        }
-      }
-    }
+    unionDepsFromRepoPackagesDir(repoRoot, declared);
   } else {
     for (const k of getDeclaredDepsWithSources(rootPkg).keys()) {
       declared.add(k);
@@ -474,8 +492,30 @@ function getDeclaredDepNamesForResolutionScope(ctx, packageDir) {
 }
 
 /**
- * Subset of publish-plan names that need a flat file:.yalc resolution here: declared dependency of this
- * scope, managed in config, and not the same repo (those stay workspace-linked).
+ * Managed package names that appear as direct npm dependencies in this resolution scope (root + packages/
+ * union when at workspace root).
+ *
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {string} packageDir
+ * @returns {Set<string>}
+ */
+function getManagedDirectDepsDeclaredInScope(ctx, packageDir) {
+  const declared = getDeclaredDepNamesForResolutionScope(ctx, packageDir);
+  const set = new Set();
+  for (const name of declared) {
+    if (ctx.config.packages[name]) {
+      set.add(name);
+    }
+  }
+  return set;
+}
+
+/**
+ * Subset of publish-plan names that need a flat file:.yalc resolution here:
+ * - Seeds: managed packages declared directly in this scope's package.json (as above).
+ * - Plus transitive managed deps: forward walk of config `dependsOn`, staying inside the publish plan
+ *   (same as expandNeedWithClosureDeps).
+ * - Exclude same-repo packages (workspace links).
  *
  * @param {{ config: object, baseDir: string }} ctx
  * @param {string} packageDir
@@ -483,12 +523,23 @@ function getDeclaredDepNamesForResolutionScope(ctx, packageDir) {
  * @returns {string[]}
  */
 function getPublishSetNamesForYalcResolutions(ctx, packageDir, publishSetNames) {
-  const declared = getDeclaredDepNamesForResolutionScope(ctx, packageDir);
+  const publishSet = new Set(publishSetNames);
+  const directManaged = getManagedDirectDepsDeclaredInScope(ctx, packageDir);
+  if (directManaged.size === 0) {
+    return [];
+  }
+
+  const closure = expandNeedWithClosureDeps(
+    publishSet,
+    directManaged,
+    ctx.config.packages,
+  );
+
   const ownerRepo = findRepoKeyForPath(ctx, packageDir);
   const out = [];
 
-  for (const name of publishSetNames) {
-    if (!declared.has(name)) {
+  for (const name of closure) {
+    if (!publishSet.has(name)) {
       continue;
     }
     const meta = ctx.config.packages[name];
@@ -500,6 +551,7 @@ function getPublishSetNamesForYalcResolutions(ctx, packageDir, publishSetNames) 
     }
     out.push(name);
   }
+  out.sort((a, b) => a.localeCompare(b));
   return out;
 }
 
@@ -585,7 +637,7 @@ function injectResolutionsSteps(commands, publishSet, args, ctx) {
             type: 'sync-resolutions',
             phase: c.phase ?? 0,
             cwd: absDir,
-            cmd: `merge scoped yalc resolutions (from publish plan of ${publishSet.length} package(s))`,
+            cmd: `merge scoped yalc resolutions in ${path.basename(absDir)} (publish plan: ${publishSet.length} package(s))`,
           });
         }
         for (const dep of names) {
