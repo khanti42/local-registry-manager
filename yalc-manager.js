@@ -60,10 +60,12 @@ Options:
                          via YAML dependsOn from those seeds (at workspace root, unions packages/). Excludes
                          same-repo packages. Uses Yarn selective parent/child keys from dependsOn when
                          possible; then yalc add at the yarn cwd; optionally symlink nested package .yalc to
-                         the repo root .yalc so nested file:.yalc paths resolve.
+                         the repo root .yalc, and relay repo .yalc into node_modules/*/.yalc and .yalc/*/.yalc
+                         where package.json uses file:.yalc so nested resolution paths work.
   --legacy-global-yalc-resolutions  With --sync-yalc-resolutions, use flat \"@scope/pkg\": file:.yalc/...
                          only (no parent/child keys).
-  --no-symlink-nested-yalc  With --sync-yalc-resolutions, skip creating nested .yalc -> repo .yalc symlinks.
+  --no-symlink-nested-yalc  With --sync-yalc-resolutions, skip nested .yalc symlinks and relay (workspace,
+                         node_modules, and .yalc store copies).
   --config <path>        Config file path. Default: yalc.yml
   --help                 Show help.
 
@@ -705,6 +707,9 @@ function syncYalcResolutionsIntoPackageJson(ctx, packageDir, publishSetNames, ar
  * @param {string} nestedDir
  */
 function ensureNestedYalcSymlink(repoRoot, nestedDir) {
+  if (path.resolve(nestedDir) === path.resolve(repoRoot)) {
+    return;
+  }
   const target = path.join(repoRoot, '.yalc');
   const linkPath = path.join(nestedDir, '.yalc');
   if (!fs.existsSync(target)) {
@@ -727,6 +732,140 @@ function ensureNestedYalcSymlink(repoRoot, nestedDir) {
     // linkPath missing
   }
   fs.symlinkSync(target, linkPath, 'dir');
+}
+
+/**
+ * True if package.json references `file:.yalc/...` in deps or resolutions.
+ *
+ * @param {object} pkgJson
+ * @returns {boolean}
+ */
+function packageJsonReferencesFileYalc(pkgJson) {
+  const blobs = [
+    pkgJson.dependencies,
+    pkgJson.devDependencies,
+    pkgJson.peerDependencies,
+    pkgJson.optionalDependencies,
+    pkgJson.resolutions,
+  ];
+  for (const blob of blobs) {
+    if (!blob || typeof blob !== 'object') {
+      continue;
+    }
+    for (const v of Object.values(blob)) {
+      if (typeof v === 'string' && isYalcFileSpecifier(v)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * For each package under `installRoot/node_modules` and `installRoot/.yalc` whose package.json
+ * references `file:.yalc/...`, ensure `packageDir/.yalc` -> `installRoot/.yalc` so nested resolution
+ * does not look for a missing nested `.yalc` path (e.g. under yalc-installed copies).
+ *
+ * @param {string} installRoot - Repo root where `yarn` runs and `.yalc` lives (e.g. extension root).
+ */
+function relayYalcSymlinksForInstallRoot(installRoot) {
+  const root = path.resolve(installRoot);
+  const yalcStore = path.join(root, '.yalc');
+  if (!fs.existsSync(yalcStore)) {
+    return;
+  }
+
+  /**
+   * @param {string} pkgDir
+   */
+  function processPackageDir(pkgDir) {
+    const pj = path.join(pkgDir, 'package.json');
+    if (!fs.existsSync(pj)) {
+      return;
+    }
+    const json = readJson(pj);
+    if (!json || !packageJsonReferencesFileYalc(json)) {
+      return;
+    }
+    ensureNestedYalcSymlink(root, pkgDir);
+  }
+
+  /**
+   * @param {string} nmDir
+   */
+  function walkNodeModulesLevel(nmDir) {
+    let entries;
+    try {
+      entries = fs.readdirSync(nmDir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      if (ent.name.startsWith('.') || ent.name === '.bin') {
+        continue;
+      }
+      const full = path.join(nmDir, ent.name);
+      if (ent.name.startsWith('@')) {
+        if (!ent.isDirectory()) {
+          continue;
+        }
+        let subEntries;
+        try {
+          subEntries = fs.readdirSync(full, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const sub of subEntries) {
+          if (!sub.isDirectory()) {
+            continue;
+          }
+          const pkgDir = path.join(full, sub.name);
+          processPackageDir(pkgDir);
+          walkNodeModulesLevel(path.join(pkgDir, 'node_modules'));
+        }
+      } else if (ent.isDirectory()) {
+        processPackageDir(full);
+        walkNodeModulesLevel(path.join(full, 'node_modules'));
+      }
+    }
+  }
+
+  const nm = path.join(root, 'node_modules');
+  if (fs.existsSync(nm)) {
+    walkNodeModulesLevel(nm);
+  }
+
+  let yalcEntries;
+  try {
+    yalcEntries = fs.readdirSync(yalcStore, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  for (const ent of yalcEntries) {
+    if (!ent.isDirectory()) {
+      continue;
+    }
+    const full = path.join(yalcStore, ent.name);
+    if (ent.name.startsWith('@')) {
+      let subs;
+      try {
+        subs = fs.readdirSync(full, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const sub of subs) {
+        if (!sub.isDirectory()) {
+          continue;
+        }
+        const pkgDir = path.join(full, sub.name);
+        processPackageDir(pkgDir);
+        walkNodeModulesLevel(path.join(pkgDir, 'node_modules'));
+      }
+    } else {
+      processPackageDir(full);
+      walkNodeModulesLevel(path.join(full, 'node_modules'));
+    }
+  }
 }
 
 /**
@@ -903,6 +1042,14 @@ function injectResolutionsSteps(commands, publishSet, args, ctx) {
             cwd: installAbs,
             cmd: `yalc add ${dep}`,
             shell: true,
+          });
+        }
+        if (args.symlinkNestedYalc && names.length) {
+          out.push({
+            type: 'relay-yalc',
+            phase: c.phase ?? 0,
+            cwd: installAbs,
+            cmd: `relay .yalc symlinks under node_modules and .yalc (install root: ${installAbs})`,
           });
         }
         if (args.symlinkNestedYalc) {
@@ -1672,6 +1819,7 @@ function getRelinkDepsOrdered(ctx, pkgName, publishSet, fullOrder, fullOrderInde
 
 /**
  * @param {1 | 2} phase
+ * @param {{ symlinkNestedYalc?: boolean }} args
  * @returns {{ type: string, phase: number, cwd: string, cmd: string, shell?: boolean }[]}
  */
 function planManagedPackageCommands(
@@ -1681,6 +1829,7 @@ function planManagedPackageCommands(
   publishSet,
   fullOrder,
   fullOrderIndex,
+  args,
 ) {
   const meta = ctx.config.packages[pkgName];
   const repoRoot = resolveRepoPath(ctx, meta.repo);
@@ -1706,6 +1855,15 @@ function planManagedPackageCommands(
     });
   }
 
+  if (args.symlinkNestedYalc && relinkDeps.length) {
+    commands.push({
+      type: 'relay-yalc',
+      phase,
+      cwd: installCwd,
+      cmd: `relay .yalc symlinks under node_modules and .yalc (install root: ${installCwd})`,
+    });
+  }
+
   commands.push({ type: 'install', phase, cwd: installCwd, cmd: 'yarn' });
 
   const build = String(meta.build ?? '').trim();
@@ -1720,7 +1878,7 @@ function planManagedPackageCommands(
  * @param {{ config: object, baseDir: string }} ctx
  * @param {{ group: string, dir: string, absoluteDir: string, installCwd: string }} consumer
  * @param {{ pkgName: string }[]} impacts
- * @param {{ stage: boolean }} options
+ * @param {{ stage: boolean, symlinkNestedYalc?: boolean }} options
  * @returns {{ type: string, phase: number, cwd: string, cmd: string, shell?: boolean }[]}
  */
 function planLinkCommands(ctx, consumer, impacts, options) {
@@ -1730,7 +1888,7 @@ function planLinkCommands(ctx, consumer, impacts, options) {
 
   const consumerRepoKey = ctx.config.consumers[consumer.group]?.repo;
   const { absoluteDir, installCwd } = consumer;
-  const { stage } = options;
+  const { stage, symlinkNestedYalc } = options;
   const commands = [];
 
   for (const impact of impacts) {
@@ -1749,6 +1907,15 @@ function planLinkCommands(ctx, consumer, impacts, options) {
       cwd: absoluteDir,
       cmd: `yalc add ${dep}`,
       shell: true,
+    });
+  }
+
+  if (symlinkNestedYalc && commands.some((x) => x.type === 'link')) {
+    commands.push({
+      type: 'relay-yalc',
+      phase: 3,
+      cwd: installCwd,
+      cmd: `relay .yalc symlinks under node_modules and .yalc (install root: ${installCwd})`,
     });
   }
 
@@ -1796,6 +1963,10 @@ function printCommandList(commands, args) {
         info(
           `# ${c.cwd}: ${c.cmd} (yalc-manager creates symlink; no shell step)`,
         );
+        continue;
+      }
+      if (c.type === 'relay-yalc') {
+        info(`# ${c.cwd}: ${c.cmd} (yalc-manager; no shell step)`);
         continue;
       }
       if (
@@ -1851,6 +2022,13 @@ function executeCommands(commands, dryRun, options = {}) {
       ensureNestedYalcSymlink(c.repoRoot, c.cwd);
       continue;
     }
+    if (c.type === 'relay-yalc') {
+      if (dryRun) {
+        continue;
+      }
+      relayYalcSymlinksForInstallRoot(c.cwd);
+      continue;
+    }
     if (c.type === 'clean-unlink-nested') {
       if (dryRun) {
         continue;
@@ -1898,6 +2076,7 @@ function buildCommandPlan(ctx, plan, phase1Packages, phase2Packages, impactRepor
         publishSet,
         fullOrder,
         fullOrderIndex,
+        args,
       ),
     );
   }
@@ -1911,6 +2090,7 @@ function buildCommandPlan(ctx, plan, phase1Packages, phase2Packages, impactRepor
         publishSet,
         fullOrder,
         fullOrderIndex,
+        args,
       ),
     );
   }
@@ -1925,6 +2105,7 @@ function buildCommandPlan(ctx, plan, phase1Packages, phase2Packages, impactRepor
     commands.push(
       ...planLinkCommands(ctx, report.consumer, report.impacts, {
         stage: args.stage,
+        symlinkNestedYalc: args.symlinkNestedYalc,
       }),
     );
   }
