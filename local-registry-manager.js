@@ -9,7 +9,7 @@ import semver from 'semver';
 import { bumpDevVersion as bumpDevVersionLib } from './lib/bump-dev-version.js';
 import { isNpmPublish409Error } from './lib/is-npm-publish-409.js';
 
-const DEFAULT_CONFIG = 'yalc.yml';
+const DEFAULT_CONFIG = 'local-registry.yml';
 
 /** Max npm publish attempts when the registry returns E409 (version already exists). */
 const MAX_REGISTRY_PUBLISH_409_RETRIES = 50;
@@ -39,10 +39,10 @@ function parseCsv(value) {
 function printHelp() {
   console.log(`
 Usage (use "yarn node" in this repo so PnP can resolve dependencies):
-  yarn node yalc-manager.js apply --changed <pkg1,pkg2,...> [options]
-  yarn node yalc-manager.js clean [options]
-  yarn node yalc-manager.js registry apply --changed <pkg1,pkg2,...> [options]
-  yarn node yalc-manager.js registry clean [options]
+  yarn node local-registry-manager.js apply --changed <pkg1,pkg2,...> [options]
+  yarn node local-registry-manager.js clean [options]
+  yarn node local-registry-manager.js registry apply --changed <pkg1,pkg2,...> [options]
+  yarn node local-registry-manager.js registry clean [options]
 
 Commands:
   apply                  Publish/link plan from --changed and config.
@@ -78,7 +78,7 @@ Options:
                          only (no parent/child keys).
   --no-symlink-nested-yalc  With --sync-yalc-resolutions, skip nested .yalc symlinks and relay (workspace,
                          node_modules, and .yalc store copies).
-  --config <path>        Config file path. Default: yalc.yml
+  --config <path>        Config file path. Default: local-registry.yml
   --help                 Show help.
 
   Registry workflow (registry apply / registry clean):
@@ -101,11 +101,11 @@ Options:
                          yalc update/add still run in each dir under dirs. Example: installDir: .
 
 Examples:
-  yarn node yalc-manager.js apply \\
+  yarn node local-registry-manager.js apply \\
     --changed @metamask/utils,@metamask/keyring-api \\
     --dry-run
 
-  yarn node yalc-manager.js apply \\
+  yarn node local-registry-manager.js apply \\
     --changed @metamask/utils,@metamask/keyring-api,@metamask/keyring-internal-api,@metamask/eth-snap-keyring \\
     --include @metamask/accounts-controller,@metamask/bridge-controller \\
     --scope core,snap,extension
@@ -2868,25 +2868,25 @@ function printCommandList(commands, args) {
     for (const c of commands) {
       if (c.type === 'sync-resolutions') {
         info(
-          `# ${c.cwd}: ${c.cmd} (yalc-manager writes package.json resolutions; no shell step)`,
+          `# ${c.cwd}: ${c.cmd} (local-registry-manager writes package.json resolutions; no shell step)`,
         );
         continue;
       }
       if (c.type === 'symlink-nested-yalc') {
         info(
-          `# ${c.cwd}: ${c.cmd} (yalc-manager creates symlink; no shell step)`,
+          `# ${c.cwd}: ${c.cmd} (local-registry-manager creates symlink; no shell step)`,
         );
         continue;
       }
       if (c.type === 'relay-yalc') {
-        info(`# ${c.cwd}: ${c.cmd} (yalc-manager; no shell step)`);
+        info(`# ${c.cwd}: ${c.cmd} (local-registry-manager; no shell step)`);
         continue;
       }
       if (
         c.type === 'clean-unlink-nested' ||
         c.type === 'clean-strip-resolutions'
       ) {
-        info(`# ${c.cwd}: ${c.cmd} (yalc-manager; no shell step)`);
+        info(`# ${c.cwd}: ${c.cmd} (local-registry-manager; no shell step)`);
         continue;
       }
       if (
@@ -2896,7 +2896,7 @@ function printCommandList(commands, args) {
         c.type === 'registry-sync-resolutions'
       ) {
         info(
-          `# ${c.cwd}: ${c.cmd} (yalc-manager writes package.json; no shell step)`,
+          `# ${c.cwd}: ${c.cmd} (local-registry-manager writes package.json; no shell step)`,
         );
         continue;
       }

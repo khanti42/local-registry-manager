@@ -1,6 +1,6 @@
-# yalc-manager
+# local-registry-manager
 
-CLI helpers for linking MetaMask monorepos with **yalc** or a local **Verdaccio** registry. Configuration lives in `yalc.yml` beside this tool (repos, managed packages, consumers).
+CLI helpers for linking MetaMask monorepos with **yalc** or a local **Verdaccio** registry. Configuration lives in `local-registry.yml` beside this tool (repos, managed packages, consumers).
 
 ## Yalc workflow
 
@@ -12,7 +12,7 @@ Use `yarn yalc` so dependencies resolve under Yarn PnP.
 
 ## Verdaccio workflow (`registry apply`)
 
-Publishes each selected package to a registry with deterministic **dev** prerelease versions (`x.y.z-dev.1`, `x.y.z-dev.2`, …), pins **cross-repo** managed dependencies to exact versions, runs `yarn`, build, then `npm publish` (or `yarn npm publish`). Consumer directories in `yalc.yml` get matching semver pins and a final `yarn`.
+Publishes each selected package to a registry with deterministic **dev** prerelease versions (`x.y.z-dev.1`, `x.y.z-dev.2`, …), pins **cross-repo** managed dependencies to exact versions, runs `yarn`, build, then `npm publish` (or `yarn npm publish`). Consumer directories in `local-registry.yml` get matching semver pins and a final `yarn`.
 
 **Prerequisites**
 
@@ -59,9 +59,9 @@ Same `--from-step <n>` works for `yarn yalc apply` (yalc workflow).
 
 **Deduping with Yarn `resolutions`**
 
-Large monorepos often pull multiple semver-compatible copies of the same internal package, which can break TypeScript when types diverge. Pass **`--sync-registry-resolutions`** on `registry apply`: before the first **`yarn`** at each install root in **phase 2 and phase 3** (not phase 1), the tool merges **`resolutions`** into that repo’s **workspace root** `package.json` only. **Which package names get pinned** uses the same logic as **`--sync-yalc-resolutions`**: `getPublishSetNamesForYalcResolutions` (declared managed dependencies in resolution scope, transitive closure within the publish plan, exclude same-repo workspace packages). Stale keys for publish-plan names that would not be yalc-pinned here are removed. Phase 1 is the first publish wave (for example `accounts`); phase 2 is the next wave (for example `core`); phase 3 is **`consumers`** in `yalc.yml`. Nested `packages/*` manifests are not edited. Restore with git when done, like other `package.json` edits.
+Large monorepos often pull multiple semver-compatible copies of the same internal package, which can break TypeScript when types diverge. Pass **`--sync-registry-resolutions`** on `registry apply`: before the first **`yarn`** at each install root in **phase 2 and phase 3** (not phase 1), the tool merges **`resolutions`** into that repo’s **workspace root** `package.json` only. **Which package names get pinned** uses the same logic as **`--sync-yalc-resolutions`**: `getPublishSetNamesForYalcResolutions` (declared managed dependencies in resolution scope, transitive closure within the publish plan, exclude same-repo workspace packages). Stale keys for publish-plan names that would not be yalc-pinned here are removed. Phase 1 is the first publish wave (for example `accounts`); phase 2 is the next wave (for example `core`); phase 3 is **`consumers`** in `local-registry.yml`. Nested `packages/*` manifests are not edited. Restore with git when done, like other `package.json` edits.
 
-Optional top-level key in `yalc.yml`:
+Optional top-level key in `local-registry.yml`:
 
 ```yaml
 registry: http://localhost:4873
@@ -83,7 +83,7 @@ If `npm publish` rejects scoped packages, ensure `.npmrc` includes `access=publi
 
 ## Config
 
-See `yalc.yml` for `repos`, `packages` (`publishDir`, `build`, `dependsOn`), and `consumers`.
+See `local-registry.yml` for `repos`, `packages` (`publishDir`, `build`, `dependsOn`), and `consumers`.
 
 ## Tests
 
