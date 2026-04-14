@@ -7,7 +7,9 @@
     "semver": "^7.6.3"
   },
   "scripts": {
-    "yalc": "node yalc-manager.js"
+    "yalc": "yarn node yalc-manager.js",
+    "registry": "yarn node yalc-manager.js registry",
+    "test": "yarn node --test lib/bump-dev-version.test.js lib/is-npm-publish-409.test.js"
   },
   "packageManager": "yarn@4.6.0"
 }

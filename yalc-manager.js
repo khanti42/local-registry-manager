@@ -3,11 +3,16 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
-import { execSync } from 'node:child_process';
+import { execSync, spawnSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import semver from 'semver';
+import { bumpDevVersion as bumpDevVersionLib } from './lib/bump-dev-version.js';
+import { isNpmPublish409Error } from './lib/is-npm-publish-409.js';
 
 const DEFAULT_CONFIG = 'yalc.yml';
+
+/** Max npm publish attempts when the registry returns E409 (version already exists). */
+const MAX_REGISTRY_PUBLISH_409_RETRIES = 50;
 
 function fail(message) {
   console.error(`\nERROR: ${message}`);
@@ -33,14 +38,20 @@ function parseCsv(value) {
 
 function printHelp() {
   console.log(`
-Usage:
-  node yalc-manager.js apply --changed <pkg1,pkg2,...> [options]
-  node yalc-manager.js clean [options]
+Usage (use "yarn node" in this repo so PnP can resolve dependencies):
+  yarn node yalc-manager.js apply --changed <pkg1,pkg2,...> [options]
+  yarn node yalc-manager.js clean [options]
+  yarn node yalc-manager.js registry apply --changed <pkg1,pkg2,...> [options]
+  yarn node yalc-manager.js registry clean [options]
 
 Commands:
   apply                  Publish/link plan from --changed and config.
   clean                  In all configured repo and consumer dirs: yalc remove for yalc-linked managed
                          packages, remove nested .yalc symlinks created by --sync-yalc-resolutions.
+  registry apply         Verdaccio workflow: pin cross-repo managed deps, yarn, bump dev versions,
+                         build, npm publish; then update consumer package.json and yarn.
+                         Requires a running registry and publishConfig.registry (or --registry) on packages.
+  registry clean         Prints manual restore hints only (does not edit files).
 
 Options:
   --changed <csv>        Required. Managed packages you changed directly.
@@ -55,6 +66,7 @@ Options:
   --stage                git add package.json yalc.lock .yalc after yalc operations.
   --show-changelog       Print changelog excerpt for risky updates (with dry-run, risky rows only).
   --show-shell-preview   After the command list, print (cd <cwd> && <cmd>) lines (off by default).
+  --from-step <n>        Run from step n onward (1 = first line in "Command list"). apply / registry apply only.
   --sync-yalc-resolutions  Before each first yarn, merge package.json resolutions where needed: publish-plan
                          packages that are direct managed deps of the target, plus transitive managed deps
                          via YAML dependsOn from those seeds (at workspace root, unions packages/). Excludes
@@ -69,16 +81,31 @@ Options:
   --config <path>        Config file path. Default: yalc.yml
   --help                 Show help.
 
+  Registry workflow (registry apply / registry clean):
+  --registry <url>       npm/Verdaccio registry URL (overrides optional top-level "registry" in YAML).
+  --preid <name>         Prerelease id for local bumps (default: dev) -> x.y.z-<preid>.N
+  --publish-tag <name>   Dist-tag for npm publish (default: same as --preid). Required for prereleases.
+  --use-yarn-publish     Run "yarn npm publish" instead of "npm publish" in each publishDir.
+  --force-registry-publish
+                         With registry apply, always run npm publish even when that exact version already
+                         exists on the registry (default: skip publish to avoid E409 duplicate version).
+                         If publish still returns E409, the tool bumps dev.N and retries (also updates pins /
+                         resolutions) until success or max attempts.
+  --sync-registry-resolutions
+                         Before each phase 2 or 3 yarn (not phase 1), merge semver resolutions at the workspace
+                         root; package names match --sync-yalc-resolutions (declared managed deps + closure,
+                         exclude same-repo). Phase 1 skipped.
+
   Consumer YAML (per group under consumers.<name>):
     installDir: <path>   Optional, relative to that group's repo root. When set, yarn runs there;
                          yalc update/add still run in each dir under dirs. Example: installDir: .
 
 Examples:
-  node yalc-manager.js apply \\
+  yarn node yalc-manager.js apply \\
     --changed @metamask/utils,@metamask/keyring-api \\
     --dry-run
 
-  node yalc-manager.js apply \\
+  yarn node yalc-manager.js apply \\
     --changed @metamask/utils,@metamask/keyring-api,@metamask/keyring-internal-api,@metamask/eth-snap-keyring \\
     --include @metamask/accounts-controller,@metamask/bridge-controller \\
     --scope core,snap,extension
@@ -97,9 +124,16 @@ function parseArgs(argv) {
     showChangelog: false,
     showShellPreview: false,
     syncYalcResolutions: false,
+    syncRegistryResolutions: false,
     legacyGlobalYalcResolutions: false,
     symlinkNestedYalc: true,
     config: DEFAULT_CONFIG,
+    registryUrl: null,
+    preid: 'dev',
+    publishTag: null,
+    useYarnPublish: false,
+    forceRegistryPublish: false,
+    fromStep: null,
   };
 
   const positional = [];
@@ -125,6 +159,10 @@ function parseArgs(argv) {
     }
     if (arg === '--sync-yalc-resolutions') {
       args.syncYalcResolutions = true;
+      continue;
+    }
+    if (arg === '--sync-registry-resolutions') {
+      args.syncRegistryResolutions = true;
       continue;
     }
     if (arg === '--legacy-global-yalc-resolutions') {
@@ -175,6 +213,67 @@ function parseArgs(argv) {
       args.config = arg.slice('--config='.length);
       continue;
     }
+    if (arg === '--registry') {
+      args.registryUrl = argv[++i];
+      continue;
+    }
+    if (arg.startsWith('--registry=')) {
+      args.registryUrl = arg.slice('--registry='.length);
+      continue;
+    }
+    if (arg === '--preid') {
+      args.preid = argv[++i];
+      continue;
+    }
+    if (arg.startsWith('--preid=')) {
+      args.preid = arg.slice('--preid='.length);
+      continue;
+    }
+    if (arg === '--use-yarn-publish') {
+      args.useYarnPublish = true;
+      continue;
+    }
+    if (arg === '--force-registry-publish') {
+      args.forceRegistryPublish = true;
+      continue;
+    }
+    if (arg === '--publish-tag') {
+      args.publishTag = argv[++i];
+      continue;
+    }
+    if (arg.startsWith('--publish-tag=')) {
+      args.publishTag = arg.slice('--publish-tag='.length);
+      continue;
+    }
+    if (arg === '--from-step') {
+      const raw = argv[++i];
+      if (raw === undefined) {
+        fail('--from-step requires a positive integer (1 = first command in the list)');
+      }
+      const n = Number.parseInt(String(raw), 10);
+      if (
+        !Number.isFinite(n) ||
+        n < 1 ||
+        String(n) !== String(raw).trim()
+      ) {
+        fail('--from-step must be a positive integer (1 = first command in the list)');
+      }
+      args.fromStep = n;
+      continue;
+    }
+    if (arg.startsWith('--from-step=')) {
+      const raw = arg.slice('--from-step='.length);
+      const n = Number.parseInt(String(raw), 10);
+      if (
+        !Number.isFinite(n) ||
+        n < 1 ||
+        String(n) !== String(raw).trim()
+      ) {
+        fail('--from-step must be a positive integer (1 = first command in the list)');
+      }
+      args.fromStep = n;
+      continue;
+    }
     if (arg === '--help' || arg === '-h') {
       printHelp();
       process.exit(0);
@@ -185,7 +284,18 @@ function parseArgs(argv) {
     positional.push(arg);
   }
 
-  args.command = positional[0] ?? null;
+  if (positional[0] === 'registry') {
+    if (!positional[1]) {
+      fail('registry requires a subcommand: apply | clean');
+    }
+    const sub = positional[1];
+    if (sub !== 'apply' && sub !== 'clean') {
+      fail(`Unknown registry subcommand: ${sub} (expected apply | clean)`);
+    }
+    args.command = `registry-${sub}`;
+  } else {
+    args.command = positional[0] ?? null;
+  }
   return args;
 }
 
@@ -200,6 +310,10 @@ function loadConfig(configPath) {
 
   if (!config?.repos || !config?.packages || !config?.consumers) {
     fail('Config must contain repos, packages, and consumers');
+  }
+
+  if (config.registry != null && typeof config.registry !== 'string') {
+    fail('Config "registry" must be a string URL when set');
   }
 
   return {
@@ -327,13 +441,54 @@ function getInstallCwdForManagedPackage(ctx, pkgName) {
 }
 
 /**
+ * Env vars so Yarn Berry and npm resolve packages from a local Verdaccio (proxies to npmjs).
+ *
+ * Yarn 4+ blocks plain HTTP registries unless the host is in `unsafeHttpWhitelist` (YN0081).
+ * Array settings accept a comma-separated string via `YARN_UNSAFE_HTTP_WHITELIST`.
+ *
+ * @param {string} registryUrl
+ * @returns {Record<string, string>}
+ */
+function getRegistryEnvForYarnInstall(registryUrl) {
+  const out = {
+    npm_config_registry: registryUrl,
+    NPM_CONFIG_REGISTRY: registryUrl,
+    YARN_NPM_REGISTRY_SERVER: registryUrl,
+  };
+  try {
+    const u = new URL(registryUrl);
+    if (u.protocol === 'http:') {
+      const hosts = new Set(['localhost', '127.0.0.1']);
+      if (u.hostname) {
+        hosts.add(u.hostname);
+      }
+      out.YARN_UNSAFE_HTTP_WHITELIST = [...hosts].join(',');
+    }
+  } catch {
+    // ignore invalid registry URL
+  }
+  return out;
+}
+
+/**
  * @param {string} cmd
  * @param {string} cwd
- * @param {{ dryRun?: boolean, shell?: boolean }} [options]
+ * @param {{ dryRun?: boolean, shell?: boolean, env?: Record<string, string> | null }} [options]
  */
-function run(cmd, cwd, { dryRun = false, shell = false } = {}) {
+function run(cmd, cwd, { dryRun = false, shell = false, env: envOverrides = null } = {}) {
   console.log(`\n$ ${cmd}`);
   console.log(`  cwd: ${cwd}`);
+  if (envOverrides) {
+    const r = envOverrides.npm_config_registry ?? envOverrides.YARN_NPM_REGISTRY_SERVER;
+    if (r) {
+      console.log(`  env: npm registry -> ${r}`);
+    }
+    if (envOverrides.YARN_UNSAFE_HTTP_WHITELIST) {
+      console.log(
+        `  env: Yarn unsafeHttpWhitelist -> ${envOverrides.YARN_UNSAFE_HTTP_WHITELIST}`,
+      );
+    }
+  }
 
   if (dryRun) {
     console.log('  skipped (dry-run)');
@@ -341,10 +496,74 @@ function run(cmd, cwd, { dryRun = false, shell = false } = {}) {
   }
 
   try {
-    execSync(cmd, { cwd, stdio: 'inherit', shell });
+    const execOpts = { cwd, stdio: 'inherit', shell };
+    if (envOverrides) {
+      execOpts.env = { ...process.env, ...envOverrides };
+    }
+    execSync(cmd, execOpts);
     return { ok: true, code: 0 };
   } catch (error) {
     return { ok: false, code: typeof error.status === 'number' ? error.status : 1 };
+  }
+}
+
+/**
+ * Run a shell command and capture stdout/stderr (used to detect npm E409 without losing output).
+ *
+ * @param {string} cmd
+ * @param {string} cwd
+ * @param {Record<string, string> | null} envOverrides
+ * @returns {{ code: number, stdout: string, stderr: string }}
+ */
+function spawnShellCapture(cmd, cwd, envOverrides = null) {
+  const env = envOverrides ? { ...process.env, ...envOverrides } : process.env;
+  const result = spawnSync(cmd, {
+    cwd,
+    shell: true,
+    encoding: 'utf8',
+    env,
+  });
+  return {
+    code: result.status ?? 1,
+    stdout: result.stdout ?? '',
+    stderr: result.stderr ?? '',
+  };
+}
+
+/**
+ * After an extra dev-version bump, keep the in-memory plan and workspace resolutions aligned.
+ *
+ * @param {Map<string, string>} registryVersionMap
+ * @param {string} pkgName
+ * @param {string} newVersion
+ * @param {{ type: string, pins?: Array<{ name: string, version: string }> }[]} commands
+ * @param {number} afterCommandIndex
+ */
+function applyVersionBumpToFuturePins(
+  registryVersionMap,
+  pkgName,
+  newVersion,
+  commands,
+  afterCommandIndex,
+) {
+  registryVersionMap.set(pkgName, newVersion);
+  for (let j = afterCommandIndex + 1; j < commands.length; j += 1) {
+    const cmd = commands[j];
+    if (
+      cmd.type !== 'registry-pin-deps' &&
+      cmd.type !== 'registry-pin-consumer-deps'
+    ) {
+      continue;
+    }
+    const pins = cmd.pins;
+    if (!Array.isArray(pins)) {
+      continue;
+    }
+    for (const pin of pins) {
+      if (pin && pin.name === pkgName) {
+        pin.version = newVersion;
+      }
+    }
   }
 }
 
@@ -365,6 +584,79 @@ function readJson(filePath) {
 }
 
 /**
+ * @param {string} filePath
+ * @param {unknown} data
+ */
+function writeJson(filePath, data) {
+  fs.writeFileSync(filePath, `${JSON.stringify(data, null, 2)}\n`, 'utf8');
+}
+
+/**
+ * @param {string} version
+ * @param {string} preid
+ * @returns {string}
+ */
+function bumpDevVersion(version, preid) {
+  try {
+    return bumpDevVersionLib(version, preid);
+  } catch (e) {
+    fail(e instanceof Error ? e.message : String(e));
+  }
+}
+
+/**
+ * Simulated next versions for every managed package from current package.json on disk (planning / dry-run).
+ *
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {string[]} publishOrder
+ * @param {string} preid
+ * @returns {Map<string, string>}
+ */
+function simulatePublishedVersionsMap(ctx, publishOrder, preid) {
+  const map = new Map();
+  for (const pkgName of publishOrder) {
+    const { json } = getPackageSourcePackageJson(ctx, pkgName);
+    const next = bumpDevVersion(json.version ?? '0.0.0', preid);
+    map.set(pkgName, next);
+  }
+  return map;
+}
+
+/**
+ * @param {string} packageDir
+ * @param {Array<{ name: string, version: string }>} pins
+ * @param {boolean} dryRun
+ */
+function pinExactVersionsInPackageJson(packageDir, pins, dryRun) {
+  if (!pins.length) {
+    return;
+  }
+  const filePath = path.join(packageDir, 'package.json');
+  const pkg = readJson(filePath);
+  if (!pkg) {
+    fail(`Missing or invalid package.json: ${filePath}`);
+  }
+  const sections = [
+    'dependencies',
+    'devDependencies',
+    'peerDependencies',
+    'optionalDependencies',
+  ];
+  let changed = false;
+  for (const { name, version } of pins) {
+    for (const sec of sections) {
+      if (pkg[sec]?.[name] !== undefined) {
+        pkg[sec][name] = version;
+        changed = true;
+      }
+    }
+  }
+  if (changed && !dryRun) {
+    writeJson(filePath, pkg);
+  }
+}
+
+/**
  * Quote a path for bash `cd` / one-liners (unquoted when safe).
  * @param {string} p
  * @returns {string}
@@ -375,6 +667,38 @@ function shellQuotePath(p) {
     return s;
   }
   return `'${s.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * @param {string} spec npm package@version (scoped names OK)
+ * @returns {string}
+ */
+function shellQuoteNpmPackageAtVersion(spec) {
+  return `'${String(spec).replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * True if `npm view` can resolve this exact version on the registry (avoids republishing / E409).
+ * On lookup failure (offline, 404), returns false so publish is still attempted.
+ *
+ * @param {string} registryUrl
+ * @param {string} packageName
+ * @param {string} version
+ * @returns {boolean}
+ */
+function isVersionPublishedOnRegistry(registryUrl, packageName, version) {
+  const reg = shellQuotePath(registryUrl);
+  const spec = shellQuoteNpmPackageAtVersion(`${packageName}@${version}`);
+  try {
+    const out = execSync(`npm view ${spec} version --registry ${reg}`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: true,
+    });
+    return String(out).trim() === version;
+  } catch {
+    return false;
+  }
 }
 
 /**
@@ -438,6 +762,31 @@ function collectDirsToSyncYalcResolutions(installCwd) {
     }
   }
   return out;
+}
+
+/**
+ * Where to merge Yarn `resolutions` for registry dedupe: **workspace root only** (one package.json per
+ * install tree). Nested workspace packages under that root are excluded so upstream monorepo
+ * packages are not edited.
+ *
+ * @param {string} installCwd
+ * @returns {string | null}
+ */
+function getRegistryResolutionsPackageJsonDir(installCwd) {
+  const abs = path.resolve(installCwd);
+  const root = findMonorepoWorkspaceRoot(abs);
+  if (root) {
+    return root;
+  }
+  const pkgPath = path.join(abs, 'package.json');
+  const pkg = readJson(pkgPath);
+  if (pkg?.workspaces) {
+    return abs;
+  }
+  if (pkg) {
+    return abs;
+  }
+  return null;
 }
 
 /**
@@ -1075,6 +1424,99 @@ function injectResolutionsSteps(commands, publishSet, args, ctx) {
               cmd: `symlink ${path.join(absDir, '.yalc')} -> ${path.join(repoRoot, '.yalc')}`,
             });
           }
+        }
+      }
+    }
+    out.push(c);
+  }
+  return out;
+}
+
+/**
+ * Merge exact semver pins into `package.json` `resolutions` using the **same package-name filter as yalc**
+ * (`getPublishSetNamesForYalcResolutions`): declared managed deps in this scope, transitive closure inside
+ * the publish plan, exclude same-repo workspace packages — then pin those names to registry versions.
+ * Removes `resolutions[name]` for publish-plan names that yalc would not pin here (stale keys).
+ *
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {string} packageDir
+ * @param {string[]} publishSetNames
+ * @param {Map<string, string>} versionMap
+ */
+function syncRegistryResolutionsIntoPackageJson(
+  ctx,
+  packageDir,
+  publishSetNames,
+  versionMap,
+) {
+  const filePath = path.join(packageDir, 'package.json');
+  const pkg = readJson(filePath);
+  if (!pkg) {
+    fail(`Missing or invalid package.json: ${filePath}`);
+  }
+  const filtered = getPublishSetNamesForYalcResolutions(
+    ctx,
+    packageDir,
+    publishSetNames,
+  );
+  const filteredSet = new Set(filtered);
+  const next = { ...(pkg.resolutions ?? {}) };
+  for (const name of publishSetNames) {
+    if (filteredSet.has(name)) {
+      const ver = versionMap.get(name);
+      if (ver) {
+        next[name] = ver;
+      }
+    } else {
+      delete next[name];
+    }
+  }
+  pkg.resolutions = next;
+  writeJson(filePath, pkg);
+}
+
+/**
+ * Insert registry resolution-merge steps before the first `yarn` at each install cwd for **phase 2 and 3**
+ * only. Phase 1 (first publish wave, e.g. accounts) is skipped so those repos are not touched. Phase 2
+ * covers intermediate monorepos that publish after phase 1 (e.g. core); phase 3 is `consumers` in YAML.
+ * Writes only the workspace root `package.json`, not nested `packages/*` workspaces.
+ *
+ * @param {Array<{ type: string, phase?: number, cwd: string, cmd: string, shell?: boolean }>} commands
+ * @param {string[]} publishSet
+ * @param {{ syncRegistryResolutions?: boolean }} args
+ * @param {{ config: object, baseDir: string }} ctx
+ * @returns {typeof commands}
+ */
+function injectRegistryResolutionsSteps(commands, publishSet, args, ctx) {
+  if (!args.syncRegistryResolutions || publishSet.length === 0) {
+    return commands;
+  }
+  const seenInstallCwd = new Set();
+  const seenSyncedDirs = new Set();
+  const out = [];
+  for (const c of commands) {
+    if (
+      c.type === 'install' &&
+      c.cmd === 'yarn' &&
+      (c.phase === 2 || c.phase === 3) &&
+      !seenInstallCwd.has(c.cwd)
+    ) {
+      const absDir = getRegistryResolutionsPackageJsonDir(c.cwd);
+      if (absDir) {
+        seenInstallCwd.add(c.cwd);
+        if (!seenSyncedDirs.has(absDir)) {
+          seenSyncedDirs.add(absDir);
+          const filtered = getPublishSetNamesForYalcResolutions(
+            ctx,
+            absDir,
+            publishSet,
+          );
+          out.push({
+            type: 'registry-sync-resolutions',
+            phase: c.phase ?? 0,
+            cwd: absDir,
+            cmd: `merge resolutions (registry dedupe, yalc filter) in ${path.basename(absDir)} (${filtered.length}/${publishSet.length} package(s))`,
+          });
         }
       }
     }
@@ -1934,6 +2376,476 @@ function planLinkCommands(ctx, consumer, impacts, options) {
 }
 
 /**
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {{ registryUrl?: string | null }} args
+ * @returns {string}
+ */
+function getResolvedRegistryUrl(args, ctx) {
+  return args.registryUrl ?? ctx.config.registry ?? 'http://localhost:4873';
+}
+
+/**
+ * npm requires `--tag` when publishing prereleases; default tag matches `--preid` (usually "dev").
+ *
+ * @param {{ publishTag?: string | null, preid?: string }} args
+ * @returns {string}
+ */
+function getResolvedPublishTag(args) {
+  return args.publishTag ?? args.preid ?? 'dev';
+}
+
+/**
+ * @param {{ fromStep?: number | null }} args
+ * @returns {number}
+ */
+function getFromStep(args) {
+  return args.fromStep ?? 1;
+}
+
+/**
+ * @param {number} fromStep
+ * @param {number} commandCount
+ */
+function assertFromStepInRange(fromStep, commandCount) {
+  if (commandCount > 0 && fromStep > commandCount) {
+    fail(
+      `--from-step ${fromStep} exceeds command list length (${commandCount})`,
+    );
+  }
+}
+
+/**
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {object} plan
+ * @param {string[]} phase1Packages
+ * @param {string[]} phase2Packages
+ * @param {object[]} impactReports
+ * @param {object} args
+ * @param {Map<string, string>} versionMap
+ */
+function buildRegistryCommandPlan(
+  ctx,
+  plan,
+  phase1Packages,
+  phase2Packages,
+  impactReports,
+  args,
+  versionMap,
+) {
+  const publishSet = new Set(plan.publishSet);
+  const fullOrder = [...phase1Packages, ...phase2Packages];
+  const fullOrderIndex = new Map(fullOrder.map((p, i) => [p, i]));
+  const commands = [];
+
+  for (const pkgName of phase1Packages) {
+    commands.push(
+      ...planRegistryManagedPackageCommands(
+        ctx,
+        pkgName,
+        1,
+        publishSet,
+        fullOrder,
+        fullOrderIndex,
+        args,
+        versionMap,
+      ),
+    );
+  }
+
+  for (const pkgName of phase2Packages) {
+    commands.push(
+      ...planRegistryManagedPackageCommands(
+        ctx,
+        pkgName,
+        2,
+        publishSet,
+        fullOrder,
+        fullOrderIndex,
+        args,
+        versionMap,
+      ),
+    );
+  }
+
+  for (const report of impactReports) {
+    if (!report.exists || report.impacts.length === 0) {
+      continue;
+    }
+    if (
+      findManagedPackageForAbsoluteDir(ctx, report.consumer.absoluteDir) !== null
+    ) {
+      continue;
+    }
+    commands.push(
+      ...planRegistryConsumerCommands(ctx, report.consumer, report.impacts, versionMap, {
+        stage: args.stage,
+      }),
+    );
+  }
+
+  return commands;
+}
+
+/**
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {string} pkgName
+ * @param {number} phase
+ * @param {Set<string>} publishSet
+ * @param {string[]} fullOrder
+ * @param {Map<string, number>} fullOrderIndex
+ * @param {object} args
+ * @param {Map<string, string>} versionMap
+ */
+function planRegistryManagedPackageCommands(
+  ctx,
+  pkgName,
+  phase,
+  publishSet,
+  fullOrder,
+  fullOrderIndex,
+  args,
+  versionMap,
+) {
+  const meta = ctx.config.packages[pkgName];
+  const repoRoot = resolveRepoPath(ctx, meta.repo);
+  const publishDir = path.resolve(repoRoot, meta.publishDir);
+  const relinkDeps = getRelinkDepsOrdered(
+    ctx,
+    pkgName,
+    publishSet,
+    fullOrder,
+    fullOrderIndex,
+  );
+  const installCwd = getInstallCwdForManagedPackage(ctx, pkgName);
+  const commands = [];
+
+  const pins = relinkDeps
+    .map((d) => ({ name: d, version: versionMap.get(d) }))
+    .filter((x) => x.version);
+
+  if (pins.length) {
+    commands.push({
+      type: 'registry-pin-deps',
+      phase,
+      cwd: publishDir,
+      pins,
+      cmd: `pin deps: ${pins.map((p) => `${p.name}@${p.version}`).join(', ')}`,
+    });
+  }
+
+  commands.push({ type: 'install', phase, cwd: installCwd, cmd: 'yarn' });
+
+  const nextVer = versionMap.get(pkgName);
+  commands.push({
+    type: 'registry-bump',
+    phase,
+    cwd: publishDir,
+    pkgName,
+    preid: args.preid,
+    cmd: `bump ${pkgName} to ${nextVer ?? '(unknown)'}`,
+  });
+
+  const build = String(meta.build ?? '').trim();
+  if (build) {
+    commands.push({
+      type: 'run-cmd',
+      phase,
+      cwd: repoRoot,
+      cmd: build,
+      shell: true,
+    });
+  }
+
+  const regUrl = args.registryUrlResolved ?? 'http://localhost:4873';
+  const distTag = args.publishTagResolved ?? getResolvedPublishTag(args);
+  const pubCmd = args.useYarnPublish ? 'yarn npm publish' : 'npm publish';
+  commands.push({
+    type: 'registry-npm-publish',
+    phase,
+    cwd: publishDir,
+    cmd: `${pubCmd} --registry ${regUrl} --tag ${distTag}`,
+  });
+
+  return commands;
+}
+
+/**
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {{ group: string, dir: string, absoluteDir: string, installCwd: string }} consumer
+ * @param {object[]} impacts
+ * @param {Map<string, string>} versionMap
+ * @param {{ stage: boolean }} options
+ */
+function planRegistryConsumerCommands(ctx, consumer, impacts, versionMap, options) {
+  if (!impacts.length) {
+    return [];
+  }
+
+  const consumerRepoKey = ctx.config.consumers[consumer.group]?.repo;
+  const { absoluteDir, installCwd } = consumer;
+  const { stage } = options;
+  const commands = [];
+
+  const pins = [];
+  for (const impact of impacts) {
+    const depMeta = ctx.config.packages[impact.pkgName];
+    if (
+      consumerRepoKey != null &&
+      depMeta &&
+      depMeta.repo === consumerRepoKey
+    ) {
+      continue;
+    }
+    const ver = versionMap.get(impact.pkgName);
+    if (!ver) {
+      continue;
+    }
+    pins.push({ name: impact.pkgName, version: ver });
+  }
+
+  if (pins.length) {
+    commands.push({
+      type: 'registry-pin-consumer-deps',
+      phase: 3,
+      cwd: absoluteDir,
+      pins,
+      cmd: `pin consumer deps: ${pins.map((p) => `${p.name}@${p.version}`).join(', ')}`,
+    });
+  }
+
+  commands.push({ type: 'install', phase: 3, cwd: installCwd, cmd: 'yarn' });
+
+  if (stage) {
+    commands.push({
+      type: 'git',
+      phase: 3,
+      cwd: absoluteDir,
+      cmd: 'git add package.json',
+    });
+  }
+
+  return commands;
+}
+
+/**
+ * @param {{ type: string, phase?: number, cwd: string, cmd: string, shell?: boolean, pins?: object[] }[]} commands
+ * @param {boolean} dryRun
+ * @param {{ ctx?: object, args?: object, registryUrl?: string, fromStep?: number, registryPublishSet?: string[], registryVersionMap?: Map<string, string> }} options
+ */
+function executeRegistryCommands(commands, dryRun, options = {}) {
+  const {
+    ctx,
+    args,
+    registryUrl,
+    fromStep: fromStepOption,
+    registryPublishSet = [],
+    registryVersionMap = new Map(),
+  } = options;
+  const useYarnPublish = args?.useYarnPublish === true;
+  const total = commands.length;
+  const fromStep = fromStepOption ?? 1;
+  const regArg = shellQuotePath(registryUrl ?? 'http://localhost:4873');
+  const tagArg = shellQuotePath(
+    args?.publishTagResolved ?? getResolvedPublishTag(args ?? {}),
+  );
+
+  /** Workspace dirs that already ran `registry-sync-resolutions` (re-sync after E409 version bump). */
+  const syncedResolutionsDirs = [];
+
+  for (let i = 0; i < commands.length; i += 1) {
+    const c = commands[i];
+    const commandNumber = i + 1;
+
+    if (commandNumber < fromStep) {
+      info(
+        `(skip step ${commandNumber}/${total}; --from-step ${fromStep})`,
+      );
+      continue;
+    }
+
+    if (c.type === 'registry-sync-resolutions') {
+      if (dryRun) {
+        continue;
+      }
+      if (!ctx) {
+        fail('Internal error: ctx is required for registry-sync-resolutions');
+      }
+      syncRegistryResolutionsIntoPackageJson(
+        ctx,
+        c.cwd,
+        registryPublishSet,
+        registryVersionMap,
+      );
+      if (!syncedResolutionsDirs.includes(c.cwd)) {
+        syncedResolutionsDirs.push(c.cwd);
+      }
+      continue;
+    }
+
+    if (c.type === 'registry-pin-deps' || c.type === 'registry-pin-consumer-deps') {
+      if (dryRun) {
+        continue;
+      }
+      pinExactVersionsInPackageJson(c.cwd, c.pins ?? [], false);
+      continue;
+    }
+
+    if (c.type === 'registry-bump') {
+      if (dryRun) {
+        continue;
+      }
+      const filePath = path.join(c.cwd, 'package.json');
+      const pkg = readJson(filePath);
+      if (!pkg) {
+        fail(`Missing package.json: ${filePath}`);
+      }
+      const next = bumpDevVersion(pkg.version ?? '0.0.0', c.preid ?? args?.preid ?? 'dev');
+      pkg.version = next;
+      writeJson(filePath, pkg);
+      continue;
+    }
+
+    if (c.type === 'registry-npm-publish') {
+      const registryUrlResolved = registryUrl ?? 'http://localhost:4873';
+      const preidForBump = args?.preid ?? 'dev';
+      const pubCmd = useYarnPublish
+        ? `yarn npm publish --registry ${regArg} --tag ${tagArg}`
+        : `npm publish --registry ${regArg} --tag ${tagArg}`;
+
+      if (dryRun) {
+        run(pubCmd, c.cwd, { dryRun: true, shell: true });
+        continue;
+      }
+
+      if (args?.forceRegistryPublish !== true) {
+        const filePath = path.join(c.cwd, 'package.json');
+        const pkg = readJson(filePath);
+        const pkgName = pkg?.name;
+        const pkgVersion = pkg?.version;
+        if (
+          typeof pkgName === 'string' &&
+          pkgName.length > 0 &&
+          typeof pkgVersion === 'string' &&
+          pkgVersion.length > 0 &&
+          isVersionPublishedOnRegistry(registryUrlResolved, pkgName, pkgVersion)
+        ) {
+          info(
+            `Skip npm publish: ${pkgName}@${pkgVersion} already exists on ${registryUrlResolved} (use --force-registry-publish to publish anyway).`,
+          );
+          continue;
+        }
+      }
+
+      let attempt = 0;
+      let lastCapture = { code: 1, stdout: '', stderr: '' };
+      while (attempt < MAX_REGISTRY_PUBLISH_409_RETRIES) {
+        attempt += 1;
+        console.log(`\n$ ${pubCmd}`);
+        console.log(`  cwd: ${c.cwd}`);
+        lastCapture = spawnShellCapture(pubCmd, c.cwd, null);
+        if (lastCapture.stdout) {
+          process.stdout.write(lastCapture.stdout);
+        }
+        if (lastCapture.stderr) {
+          process.stderr.write(lastCapture.stderr);
+        }
+        if (lastCapture.code === 0) {
+          break;
+        }
+        if (!isNpmPublish409Error(lastCapture.stderr, lastCapture.stdout)) {
+          const bash = formatBashOneLiner(c.cwd, pubCmd, true);
+          console.error('\nERROR: Command failed.');
+          console.error(`  command: ${commandNumber} of ${total}`);
+          console.error(`  ${bash}`);
+          console.error(`  exit code: ${lastCapture.code}`);
+          fail(`Command ${commandNumber} failed [${c.type}]: ${pubCmd}`);
+        }
+        if (attempt >= MAX_REGISTRY_PUBLISH_409_RETRIES) {
+          fail(
+            `Command ${commandNumber}: npm publish still returned E409 after ${MAX_REGISTRY_PUBLISH_409_RETRIES} attempt(s) (${pubCmd}).`,
+          );
+        }
+        const pkgPath = path.join(c.cwd, 'package.json');
+        const pkg = readJson(pkgPath);
+        const pkgName = pkg?.name;
+        const prevVer = pkg?.version;
+        if (
+          typeof pkgName !== 'string' ||
+          pkgName.length === 0 ||
+          typeof prevVer !== 'string' ||
+          prevVer.length === 0
+        ) {
+          fail(
+            `Command ${commandNumber}: cannot bump after E409 (missing name/version in ${pkgPath}).`,
+          );
+        }
+        const bumped = bumpDevVersion(prevVer, preidForBump);
+        info(
+          `Registry publish conflict (E409); bumping ${pkgName} ${prevVer} -> ${bumped} and retrying (publish attempt ${attempt + 1}/${MAX_REGISTRY_PUBLISH_409_RETRIES})...`,
+        );
+        pkg.version = bumped;
+        writeJson(pkgPath, pkg);
+        applyVersionBumpToFuturePins(
+          registryVersionMap,
+          pkgName,
+          bumped,
+          commands,
+          i,
+        );
+        if (ctx && syncedResolutionsDirs.length > 0) {
+          for (const dir of syncedResolutionsDirs) {
+            syncRegistryResolutionsIntoPackageJson(
+              ctx,
+              dir,
+              registryPublishSet,
+              registryVersionMap,
+            );
+          }
+        }
+      }
+      continue;
+    }
+
+    if (c.type === 'run-cmd') {
+      const res = run(c.cmd, c.cwd, { dryRun, shell: c.shell === true });
+      if (!res.ok) {
+        const bash = formatBashOneLiner(c.cwd, c.cmd, c.shell === true);
+        console.error('\nERROR: Command failed.');
+        console.error(`  command: ${commandNumber} of ${total}`);
+        console.error(`  ${bash}`);
+        console.error(`  exit code: ${res.code}`);
+        fail(`Command ${commandNumber} failed [${c.type}]: ${c.cmd}`);
+      }
+      continue;
+    }
+
+    if (c.type === 'install' || c.type === 'git') {
+      const registryUrlResolved = registryUrl ?? 'http://localhost:4873';
+      const useRegistryForYarn =
+        c.type === 'install' && String(c.cmd).trim() === 'yarn';
+      const res = run(c.cmd, c.cwd, {
+        dryRun,
+        shell: c.shell === true,
+        env: useRegistryForYarn
+          ? getRegistryEnvForYarnInstall(registryUrlResolved)
+          : null,
+      });
+      if (!res.ok) {
+        const bash = formatBashOneLiner(c.cwd, c.cmd, c.shell === true);
+        console.error('\nERROR: Command failed.');
+        console.error(`  command: ${commandNumber} of ${total}`);
+        console.error(`  ${bash}`);
+        console.error(`  exit code: ${res.code}`);
+        fail(`Command ${commandNumber} failed [${c.type}]: ${c.cmd}`);
+      }
+      continue;
+    }
+
+    fail(`Unknown registry workflow command type: ${c.type}`);
+  }
+}
+
+/**
  * @param {{ type: string, phase?: number, cwd: string, cmd: string, shell?: boolean }[]} commands
  * @param {{ showShellPreview?: boolean }} args
  */
@@ -1947,7 +2859,8 @@ function printCommandList(commands, args) {
   for (let i = 0; i < commands.length; i += 1) {
     const c = commands[i];
     const phase = c.phase ?? 0;
-    info(`${i + 1}. [phase ${phase}] ${c.cwd} :: ${c.cmd}`);
+    const label = c.cmd ?? c.type;
+    info(`${i + 1}. [phase ${phase}] ${c.cwd} :: ${label}`);
   }
 
   if (args.showShellPreview) {
@@ -1976,6 +2889,17 @@ function printCommandList(commands, args) {
         info(`# ${c.cwd}: ${c.cmd} (yalc-manager; no shell step)`);
         continue;
       }
+      if (
+        c.type === 'registry-pin-deps' ||
+        c.type === 'registry-pin-consumer-deps' ||
+        c.type === 'registry-bump' ||
+        c.type === 'registry-sync-resolutions'
+      ) {
+        info(
+          `# ${c.cwd}: ${c.cmd} (yalc-manager writes package.json; no shell step)`,
+        );
+        continue;
+      }
       const q = shellQuotePath(c.cwd);
       if (c.shell) {
         info(`(cd ${q} && (${c.cmd}))`);
@@ -1989,16 +2913,25 @@ function printCommandList(commands, args) {
 /**
  * @param {{ type: string, cwd: string, cmd: string, shell?: boolean, repoRoot?: string }[]} commands
  * @param {boolean} dryRun
- * @param {{ publishSet?: string[], ctx?: object, args?: { legacyGlobalYalcResolutions?: boolean } }} [options]
+ * @param {{ publishSet?: string[], ctx?: object, args?: { legacyGlobalYalcResolutions?: boolean }, fromStep?: number }} [options]
  */
 function executeCommands(commands, dryRun, options = {}) {
   const publishSet = options.publishSet ?? [];
   const { ctx } = options;
   const cmdArgs = options.args ?? { legacyGlobalYalcResolutions: false };
   const total = commands.length;
+  const fromStep = options.fromStep ?? 1;
   for (let i = 0; i < commands.length; i += 1) {
     const c = commands[i];
     const commandNumber = i + 1;
+
+    if (commandNumber < fromStep) {
+      info(
+        `(skip step ${commandNumber}/${total}; --from-step ${fromStep})`,
+      );
+      continue;
+    }
+
     if (c.type === 'sync-resolutions') {
       if (dryRun) {
         continue;
@@ -2113,6 +3046,110 @@ function buildCommandPlan(ctx, plan, phase1Packages, phase2Packages, impactRepor
   return commands;
 }
 
+function registryApplyCommand(args) {
+  if (!args.changed.length) {
+    fail('registry apply requires --changed');
+  }
+
+  const ctx = loadConfig(args.config);
+  const registryUrlResolved = getResolvedRegistryUrl(args, ctx);
+  args.registryUrlResolved = registryUrlResolved;
+  args.publishTagResolved = getResolvedPublishTag(args);
+
+  assertKnownPackages(ctx.config, args.include, 'included packages');
+  if (args.includeRepo.length) {
+    getPackagesFromRepos(ctx.config, args.includeRepo);
+  }
+
+  assertKnownPackages(ctx.config, args.changed, 'changed packages');
+
+  let plan = buildApplyPlan(ctx.config, args.changed, args.include);
+  plan = augmentPlanWithIncludeRepos(ctx, plan, args.includeRepo);
+
+  const { phase1Packages, phase2Packages } = partitionPublishPhases(
+    args.changed,
+    plan.publishSet,
+    ctx.config.packages,
+  );
+
+  const consumers = getConsumersToProcess(ctx, args.scope);
+  const impactReports = consumers.map((consumer) =>
+    getImpactForConsumer(ctx, consumer, plan),
+  );
+
+  const versionMap = simulatePublishedVersionsMap(ctx, plan.publishOrder, args.preid);
+
+  printPlan(plan, consumers, args, phase1Packages, phase2Packages);
+  section('Registry (Verdaccio)');
+  info(`Registry URL: ${registryUrlResolved}`);
+  info(`Preid: ${args.preid}`);
+  info(`Publish dist-tag: ${args.publishTagResolved}`);
+  info(`Publish command: ${args.useYarnPublish ? 'yarn npm publish' : 'npm publish'}`);
+  if (args.syncRegistryResolutions) {
+    info(
+      'Sync registry resolutions: before phase 2 and 3 yarn, merge semver pins (same name filter as yalc sync-resolutions; no nested packages/*).',
+    );
+  }
+
+  printImpactReport(ctx, impactReports, args);
+
+  let commands = buildRegistryCommandPlan(
+    ctx,
+    plan,
+    phase1Packages,
+    phase2Packages,
+    impactReports,
+    args,
+    versionMap,
+  );
+  commands = injectRegistryResolutionsSteps(commands, plan.publishSet, args, ctx);
+  printCommandList(commands, args);
+
+  assertFromStepInRange(getFromStep(args), commands.length);
+  if (getFromStep(args) > 1) {
+    section('Resume');
+    info(
+      `--from-step ${getFromStep(args)}: ${args.dryRun ? 'would skip' : 'will skip'} steps 1–${getFromStep(args) - 1}.`,
+    );
+    info('Only use this when those steps already completed successfully.');
+  }
+
+  if (args.dryRun) {
+    section('Done');
+    info('Dry-run: no commands executed.');
+    return;
+  }
+
+  executeRegistryCommands(commands, false, {
+    ctx,
+    args,
+    registryUrl: registryUrlResolved,
+    fromStep: getFromStep(args),
+    registryPublishSet: plan.publishSet,
+    registryVersionMap: versionMap,
+  });
+  section('Done');
+}
+
+function registryCleanCommand(args) {
+  if (args.fromStep != null && args.fromStep > 1) {
+    fail('--from-step is only supported for apply and registry apply');
+  }
+  section('registry clean');
+  info('This command does not modify files.');
+  info('Restore package.json after a local Verdaccio workflow with git, for example:');
+  info('  git checkout -- package.json packages/**/package.json');
+  info('Remove or edit repo-local .npmrc if you pointed registry at Verdaccio.');
+  info('');
+  const ctx = loadConfig(args.config);
+  info('Configured paths (reference):');
+  const dirs = collectAllCleanDirectories(ctx, args.scope);
+  for (const d of dirs) {
+    info(`  ${d}`);
+  }
+  section('Done');
+}
+
 function applyCommand(args) {
   if (!args.changed.length) {
     fail('apply requires --changed');
@@ -2153,13 +3190,27 @@ function applyCommand(args) {
   commands = injectResolutionsSteps(commands, plan.publishSet, args, ctx);
   printCommandList(commands, args);
 
+  assertFromStepInRange(getFromStep(args), commands.length);
+  if (getFromStep(args) > 1) {
+    section('Resume');
+    info(
+      `--from-step ${getFromStep(args)}: ${args.dryRun ? 'would skip' : 'will skip'} steps 1–${getFromStep(args) - 1}.`,
+    );
+    info('Only use this when those steps already completed successfully.');
+  }
+
   if (args.dryRun) {
     section('Done');
     info('Dry-run: no commands executed.');
     return;
   }
 
-  executeCommands(commands, false, { publishSet: plan.publishSet, ctx, args });
+  executeCommands(commands, false, {
+    publishSet: plan.publishSet,
+    ctx,
+    args,
+    fromStep: getFromStep(args),
+  });
 
   section('Done');
 }
@@ -2207,6 +3258,9 @@ function buildCleanCommands(ctx, dirs) {
 }
 
 function cleanCommand(args) {
+  if (args.fromStep != null && args.fromStep > 1) {
+    fail('--from-step is only supported for apply and registry apply');
+  }
   const ctx = loadConfig(args.config);
   const dirs = collectAllCleanDirectories(ctx, args.scope);
   section('Clean paths');
@@ -2238,6 +3292,12 @@ function main() {
       break;
     case 'clean':
       cleanCommand(args);
+      break;
+    case 'registry-apply':
+      registryApplyCommand(args);
+      break;
+    case 'registry-clean':
+      registryCleanCommand(args);
       break;
     default:
       fail(`Unknown command: ${args.command}`);
