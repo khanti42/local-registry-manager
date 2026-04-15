@@ -6,7 +6,10 @@ import process from 'node:process';
 import { execSync, spawnSync } from 'node:child_process';
 import yaml from 'js-yaml';
 import semver from 'semver';
-import { bumpDevVersion as bumpDevVersionLib } from './lib/bump-dev-version.js';
+import {
+  bumpDevVersion as bumpDevVersionLib,
+  setFixedDevPrerelease,
+} from './lib/bump-dev-version.js';
 import { isNpmPublish409Error } from './lib/is-npm-publish-409.js';
 
 const DEFAULT_CONFIG = 'local-registry.yml';
@@ -84,6 +87,9 @@ Options:
   Registry workflow (registry apply / registry clean):
   --registry <url>       npm/Verdaccio registry URL (overrides optional top-level "registry" in YAML).
   --preid <name>         Prerelease id for local bumps (default: dev) -> x.y.z-<preid>.N
+  --fixed-dev-prerelease With registry apply, always set x.y.z-<preid>.1 from major.minor.patch (no N+1).
+                         Use when you reset Verdaccio and want every publish at -<preid>.1. On E409, fails
+                         instead of bumping (clear the registry or change the base version).
   --publish-tag <name>   Dist-tag for npm publish (default: same as --preid). Required for prereleases.
   --use-yarn-publish     Run "yarn npm publish" instead of "npm publish" in each publishDir.
   --force-registry-publish
@@ -130,6 +136,7 @@ function parseArgs(argv) {
     config: DEFAULT_CONFIG,
     registryUrl: null,
     preid: 'dev',
+    fixedDevPrerelease: false,
     publishTag: null,
     useYarnPublish: false,
     forceRegistryPublish: false,
@@ -231,6 +238,10 @@ function parseArgs(argv) {
     }
     if (arg === '--use-yarn-publish') {
       args.useYarnPublish = true;
+      continue;
+    }
+    if (arg === '--fixed-dev-prerelease') {
+      args.fixedDevPrerelease = true;
       continue;
     }
     if (arg === '--force-registry-publish') {
@@ -612,11 +623,14 @@ function bumpDevVersion(version, preid) {
  * @param {string} preid
  * @returns {Map<string, string>}
  */
-function simulatePublishedVersionsMap(ctx, publishOrder, preid) {
+function simulatePublishedVersionsMap(ctx, publishOrder, preid, fixedDevPrerelease) {
   const map = new Map();
   for (const pkgName of publishOrder) {
     const { json } = getPackageSourcePackageJson(ctx, pkgName);
-    const next = bumpDevVersion(json.version ?? '0.0.0', preid);
+    const base = json.version ?? '0.0.0';
+    const next = fixedDevPrerelease
+      ? setFixedDevPrerelease(base, preid)
+      : bumpDevVersion(base, preid);
     map.set(pkgName, next);
   }
   return map;
@@ -2699,7 +2713,12 @@ function executeRegistryCommands(commands, dryRun, options = {}) {
       if (!pkg) {
         fail(`Missing package.json: ${filePath}`);
       }
-      const next = bumpDevVersion(pkg.version ?? '0.0.0', c.preid ?? args?.preid ?? 'dev');
+      const preid = c.preid ?? args?.preid ?? 'dev';
+      const base = pkg.version ?? '0.0.0';
+      const next =
+        args?.fixedDevPrerelease === true
+          ? setFixedDevPrerelease(base, preid)
+          : bumpDevVersion(base, preid);
       pkg.version = next;
       writeJson(filePath, pkg);
       continue;
@@ -2759,6 +2778,11 @@ function executeRegistryCommands(commands, dryRun, options = {}) {
           console.error(`  ${bash}`);
           console.error(`  exit code: ${lastCapture.code}`);
           fail(`Command ${commandNumber} failed [${c.type}]: ${pubCmd}`);
+        }
+        if (args?.fixedDevPrerelease === true) {
+          fail(
+            `Command ${commandNumber}: npm publish returned E409 (version already exists). With --fixed-dev-prerelease the version stays at x.y.z-<preid>.1 and is not incremented. Remove the package from Verdaccio, bump major/minor/patch in package.json if you need a new tarball, or omit --fixed-dev-prerelease to allow dev.N+1 retries.`,
+          );
         }
         if (attempt >= MAX_REGISTRY_PUBLISH_409_RETRIES) {
           fail(
@@ -3077,12 +3101,22 @@ function registryApplyCommand(args) {
     getImpactForConsumer(ctx, consumer, plan),
   );
 
-  const versionMap = simulatePublishedVersionsMap(ctx, plan.publishOrder, args.preid);
+  const versionMap = simulatePublishedVersionsMap(
+    ctx,
+    plan.publishOrder,
+    args.preid,
+    args.fixedDevPrerelease === true,
+  );
 
   printPlan(plan, consumers, args, phase1Packages, phase2Packages);
   section('Registry (Verdaccio)');
   info(`Registry URL: ${registryUrlResolved}`);
   info(`Preid: ${args.preid}`);
+  if (args.fixedDevPrerelease) {
+    info(
+      'Fixed prerelease: each managed package version -> x.y.z-<preid>.1 (no automatic N+1; E409 fails instead of bumping).',
+    );
+  }
   info(`Publish dist-tag: ${args.publishTagResolved}`);
   info(`Publish command: ${args.useYarnPublish ? 'yarn npm publish' : 'npm publish'}`);
   if (args.syncRegistryResolutions) {

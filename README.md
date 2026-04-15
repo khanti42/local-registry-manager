@@ -12,7 +12,9 @@ Use `yarn yalc` so dependencies resolve under Yarn PnP.
 
 ## Verdaccio workflow (`registry apply`)
 
-Publishes each selected package to a registry with deterministic **dev** prerelease versions (`x.y.z-dev.1`, `x.y.z-dev.2`, …), pins **cross-repo** managed dependencies to exact versions, runs `yarn`, build, then `npm publish` (or `yarn npm publish`). Consumer directories in `local-registry.yml` get matching semver pins and a final `yarn`.
+Publishes each selected package to a registry with deterministic **dev** prerelease versions (`x.y.z-dev.1`, `x.y.z-dev.2`, … by default), pins **cross-repo** managed dependencies to exact versions, runs `yarn`, build, then `npm publish` (or `yarn npm publish`). Consumer directories in `local-registry.yml` get matching semver pins and a final `yarn`.
+
+Pass **`--fixed-dev-prerelease`** on `registry apply` to **always** set `x.y.z-<preid>.1` from the current release base (major.minor.patch), with **no** automatic `N+1` between runs. Use this when you clear Verdaccio and want predictable `-dev.1` publishes. If `npm publish` hits **E409**, the run **fails** (the tool does not bump to `dev.2` in this mode); remove the package from the registry or change the base version in `package.json`.
 
 **Prerequisites**
 
@@ -51,6 +53,7 @@ yarn registry apply --changed @scope/pkg-a --scope extension
 yarn registry apply --changed @scope/pkg-a --registry http://localhost:4873 --preid dev
 yarn registry apply --changed @scope/pkg-a --publish-tag dev
 yarn registry apply --changed @scope/pkg-a --use-yarn-publish
+yarn registry apply --changed @scope/pkg-a --fixed-dev-prerelease
 # Resume after a failure (n matches the numbered lines under "Command list"):
 yarn registry apply --changed @scope/pkg-a --from-step 14
 ```
