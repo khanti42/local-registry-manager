@@ -11,6 +11,11 @@ import {
   setFixedDevPrerelease,
 } from './lib/bump-dev-version.js';
 import { isNpmPublish409Error } from './lib/is-npm-publish-409.js';
+import {
+  extractDevBase,
+  isDevPrerelease,
+  getHigherStableVersions,
+} from './lib/check-settled.js';
 
 const DEFAULT_CONFIG = 'local-registry.yml';
 
@@ -92,6 +97,8 @@ Options:
                          instead of bumping (clear the registry or change the base version).
   --publish-tag <name>   Dist-tag for npm publish (default: same as --preid). Required for prereleases.
   --use-yarn-publish     Run "yarn npm publish" instead of "npm publish" in each publishDir.
+  --skip-settled-check   Skip the pre-flight check that detects managed packages with new stable
+                         releases on npm and prompts to graduate or remove dev pins.
   --force-registry-publish
                          With registry apply, always run npm publish even when that exact version already
                          exists on the registry (default: skip publish to avoid E409 duplicate version).
@@ -141,6 +148,7 @@ function parseArgs(argv) {
     useYarnPublish: false,
     forceRegistryPublish: false,
     fromStep: null,
+    skipSettledCheck: false,
   };
 
   const positional = [];
@@ -242,6 +250,10 @@ function parseArgs(argv) {
     }
     if (arg === '--fixed-dev-prerelease') {
       args.fixedDevPrerelease = true;
+      continue;
+    }
+    if (arg === '--skip-settled-check') {
+      args.skipSettledCheck = true;
       continue;
     }
     if (arg === '--force-registry-publish') {
@@ -3070,6 +3082,270 @@ function buildCommandPlan(ctx, plan, phase1Packages, phase2Packages, impactRepor
   return commands;
 }
 
+// ---------------------------------------------------------------------------
+// Settled-version preflight
+// ---------------------------------------------------------------------------
+
+const PUBLIC_NPM_REGISTRY = 'https://registry.npmjs.org';
+
+/**
+ * Fetch all published versions of a package from the public npm registry.
+ * Returns an empty array on any error (package not found, offline, etc.).
+ *
+ * @param {string} packageName
+ * @returns {string[]}
+ */
+function fetchPublicNpmVersions(packageName) {
+  try {
+    const spec = shellQuoteNpmPackageAtVersion(packageName);
+    const out = execSync(
+      `npm view ${spec} versions --json --registry ${PUBLIC_NPM_REGISTRY}`,
+      { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], shell: true },
+    );
+    const parsed = JSON.parse(out.trim());
+    if (Array.isArray(parsed)) return parsed;
+    // npm view returns a bare string when there is only one published version
+    if (typeof parsed === 'string') return [parsed];
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Scan every consumer dir defined in config and collect managed packages that
+ * are currently pinned to a dev prerelease (x.y.z-<preid>.N).
+ *
+ * Returns a map: packageName -> { devVersion, dirs[] }
+ * where dirs is the list of absolute consumer dirs that carry the pin.
+ *
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {string} preid
+ * @returns {Map<string, { devVersion: string, dirs: string[] }>}
+ */
+function findDevPinsAcrossConsumers(ctx, preid) {
+  const managedNames = new Set(Object.keys(ctx.config.packages));
+  const result = new Map();
+
+  for (const consumerGroup of Object.values(ctx.config.consumers)) {
+    const repoRoot = resolveRepoPath(ctx, consumerGroup.repo);
+    const dirs = consumerGroup.dirs ?? ['.'];
+
+    for (const dir of dirs) {
+      const absDir = path.resolve(repoRoot, dir);
+      const pkgPath = path.join(absDir, 'package.json');
+      const pkg = readJson(pkgPath);
+      if (!pkg) continue;
+
+      const depFields = ['dependencies', 'devDependencies', 'peerDependencies'];
+      for (const field of depFields) {
+        const deps = pkg[field];
+        if (!deps || typeof deps !== 'object') continue;
+
+        for (const [name, version] of Object.entries(deps)) {
+          if (!managedNames.has(name)) continue;
+          if (typeof version !== 'string') continue;
+          if (!isDevPrerelease(version, preid)) continue;
+
+          if (!result.has(name)) {
+            result.set(name, { devVersion: version, dirs: [] });
+          }
+          const entry = result.get(name);
+          // Keep the highest dev version seen (should be the same everywhere,
+          // but guard against drift across consumer dirs).
+          if (semver.gt(version, entry.devVersion)) {
+            entry.devVersion = version;
+          }
+          entry.dirs.push(pkgPath);
+        }
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Read one line from stdin synchronously.
+ * Writes the prompt to stdout first.
+ *
+ * @param {string} question
+ * @returns {string}
+ */
+function promptSync(question) {
+  process.stdout.write(question);
+  try {
+    const buf = Buffer.allocUnsafe(1024);
+    const n = fs.readSync(0 /* stdin fd */, buf, 0, 1024);
+    return buf.slice(0, n).toString('utf8').replace(/\r?\n$/, '').trim();
+  } catch {
+    return '';
+  }
+}
+
+/**
+ * Interactively ask the user what to do with a settled package.
+ * Returns { action: 'graduate', stableVersion } or { action: 'continue' }.
+ *
+ * @param {string} pkgName
+ * @param {string} devVersion   e.g. '1.2.0-dev.3'
+ * @param {string[]} higherVersions  sorted ascending, e.g. ['1.2.1', '1.3.0']
+ * @returns {{ action: 'graduate', stableVersion: string } | { action: 'continue' }}
+ */
+function promptSettledPackage(pkgName, devVersion, higherVersions) {
+  const latest = higherVersions[higherVersions.length - 1];
+  const devBase = extractDevBase(devVersion);
+
+  info();
+  info(`  ${pkgName} — new stable versions since dev base (${devBase}):`);
+  higherVersions.forEach((v, i) => {
+    const tag = v === latest ? '  (latest)' : '';
+    info(`    [${i + 1}] ${v}${tag}`);
+  });
+  info();
+
+  // Which stable version to graduate to (only asked if graduating)
+  let chosenVersion = latest;
+  if (higherVersions.length > 1) {
+    const raw = promptSync(
+      `  Settle on which version? [1–${higherVersions.length}, default: ${higherVersions.length}] `,
+    );
+    if (raw !== '') {
+      const idx = Number.parseInt(raw, 10) - 1;
+      if (idx >= 0 && idx < higherVersions.length) {
+        chosenVersion = higherVersions[idx];
+      }
+    }
+  }
+
+  const choice = promptSync(
+    `  [g] Graduate consumers to ${chosenVersion}\n` +
+      `  [d] Continue on dev — remove pin, rebase to pick up from main\n` +
+      `  Choice? [default: g] `,
+  );
+
+  if (choice.toLowerCase() === 'd') {
+    return { action: 'continue' };
+  }
+  return { action: 'graduate', stableVersion: chosenVersion };
+}
+
+/**
+ * For each consumer package.json path in dirs, update the dependency entry
+ * for pkgName: replace with newVersion when provided, or delete the key when
+ * newVersion is null (continue-on-dev path).
+ *
+ * @param {string} pkgName
+ * @param {string[]} pkgJsonPaths
+ * @param {string | null} newVersion  null = remove the pin
+ * @param {boolean} dryRun
+ */
+function applySettledPinChange(pkgName, pkgJsonPaths, newVersion, dryRun) {
+  const depFields = ['dependencies', 'devDependencies', 'peerDependencies'];
+  for (const pkgPath of pkgJsonPaths) {
+    const pkg = readJson(pkgPath);
+    if (!pkg) continue;
+
+    let changed = false;
+    for (const field of depFields) {
+      if (pkg[field]?.[pkgName] !== undefined) {
+        if (newVersion === null) {
+          delete pkg[field][pkgName];
+        } else {
+          pkg[field][pkgName] = newVersion;
+        }
+        changed = true;
+      }
+    }
+
+    if (changed) {
+      if (dryRun) {
+        const action =
+          newVersion === null
+            ? `remove pin for ${pkgName}`
+            : `pin ${pkgName} -> ${newVersion}`;
+        info(`    [dry-run] would ${action} in ${pkgPath}`);
+      } else {
+        writeJson(pkgPath, pkg);
+      }
+    }
+  }
+}
+
+/**
+ * Pre-flight check run at the start of `registry apply`.
+ * Scans consumer pins, checks public npm for settled versions, and
+ * interactively asks the user to graduate or continue for each one.
+ *
+ * Skipped entirely when --dry-run (prints a report instead) or when
+ * stdin is not a TTY (CI safety).
+ *
+ * @param {{ config: object, baseDir: string }} ctx
+ * @param {{ preid: string, dryRun: boolean }} args
+ */
+function runSettledPreflight(ctx, args) {
+  const { preid, dryRun } = args;
+  const devPins = findDevPinsAcrossConsumers(ctx, preid);
+
+  if (devPins.size === 0) return;
+
+  // Collect settled packages first (one npm view per package)
+  const settled = [];
+  for (const [pkgName, { devVersion, dirs }] of devPins) {
+    const devBase = extractDevBase(devVersion);
+    const allVersions = fetchPublicNpmVersions(pkgName);
+    const higher = getHigherStableVersions(allVersions, devBase);
+    if (higher.length > 0) {
+      settled.push({ pkgName, devVersion, dirs, higher });
+    }
+  }
+
+  if (settled.length === 0) return;
+
+  section('Settled-version check');
+
+  if (dryRun) {
+    info('The following managed packages have new stable releases on npm:');
+    for (const { pkgName, devVersion, higher } of settled) {
+      const latest = higher[higher.length - 1];
+      info(
+        `  ${pkgName}: dev pin ${devVersion} — latest stable ${latest} (${higher.join(', ')})`,
+      );
+    }
+    info('(dry-run: skipping interactive prompts — re-run without --dry-run to act)');
+    return;
+  }
+
+  if (!process.stdin.isTTY) {
+    info('stdin is not a TTY — skipping interactive settled-version prompts.');
+    info('Pass --skip-settled-check to suppress this message.');
+    return;
+  }
+
+  info(
+    `${settled.length} managed package(s) may have settled on npm. ` +
+      `Please choose an action for each:`,
+  );
+
+  for (const { pkgName, devVersion, dirs, higher } of settled) {
+    const decision = promptSettledPackage(pkgName, devVersion, higher);
+
+    if (decision.action === 'graduate') {
+      info(
+        `  → Graduating ${pkgName}: pinning consumers to ${decision.stableVersion}`,
+      );
+      applySettledPinChange(pkgName, dirs, decision.stableVersion, false);
+    } else {
+      info(
+        `  → Removing dev pin for ${pkgName} from consumers. Rebase your branch — the version will come from main.`,
+      );
+      applySettledPinChange(pkgName, dirs, null, false);
+    }
+  }
+
+  info();
+}
+
 function registryApplyCommand(args) {
   if (!args.changed.length) {
     fail('registry apply requires --changed');
@@ -3086,6 +3362,10 @@ function registryApplyCommand(args) {
   }
 
   assertKnownPackages(ctx.config, args.changed, 'changed packages');
+
+  if (!args.skipSettledCheck) {
+    runSettledPreflight(ctx, args);
+  }
 
   let plan = buildApplyPlan(ctx.config, args.changed, args.include);
   plan = augmentPlanWithIncludeRepos(ctx, plan, args.includeRepo);
