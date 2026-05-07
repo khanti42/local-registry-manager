@@ -9,7 +9,8 @@
   "scripts": {
     "yalc": "yarn node local-registry-manager.js",
     "registry": "yarn node local-registry-manager.js registry",
-    "test": "yarn node --test lib/bump-dev-version.test.js lib/is-npm-publish-409.test.js lib/check-settled.test.js"
+    "check-dev-registry": "yarn node local-registry-manager.js check-dev-registry",
+    "test": "yarn node --test lib/bump-dev-version.test.js lib/check-dev-registry-alignment.test.js lib/check-settled.test.js lib/is-npm-publish-409.test.js"
   },
   "packageManager": "yarn@4.6.0"
 }
