@@ -16,6 +16,7 @@ import {
   isDevPrerelease,
   getHigherStableVersions,
 } from './lib/check-settled.js';
+import { latestPreidPrereleaseOnReleaseLine } from './lib/check-dev-registry-alignment.js';
 
 const DEFAULT_CONFIG = 'local-registry.yml';
 
@@ -51,6 +52,7 @@ Usage (use "yarn node" in this repo so PnP can resolve dependencies):
   yarn node local-registry-manager.js clean [options]
   yarn node local-registry-manager.js registry apply --changed <pkg1,pkg2,...> [options]
   yarn node local-registry-manager.js registry clean [options]
+  yarn node local-registry-manager.js check-dev-registry [options]
 
 Commands:
   apply                  Publish/link plan from --changed and config.
@@ -60,6 +62,10 @@ Commands:
                          build, npm publish; then update consumer package.json and yarn.
                          Requires a running registry and publishConfig.registry (or --registry) on packages.
   registry clean         Prints manual restore hints only (does not edit files).
+  check-dev-registry     For each repo in YAML with a dirty git worktree, compare managed packages'
+                         x.y.z-<preid>.N in package.json to the latest same-line prerelease on the registry.
+                         Use --all to check every managed package (ignore git).
+                         Use --fix to write package.json "version" to the registry max (with --stage: git add).
 
 Options:
   --changed <csv>        Required. Managed packages you changed directly.
@@ -97,9 +103,14 @@ Options:
                          instead of bumping (clear the registry or change the base version).
   --publish-tag <name>   Dist-tag for npm publish (default: same as --preid). Required for prereleases.
   --use-yarn-publish     Run "yarn npm publish" instead of "npm publish" in each publishDir.
-  --skip-settled-check   Skip the pre-flight check that detects managed packages with new stable
-                         releases on npm and prompts to graduate or remove dev pins. Use this in
-                         CI or any non-interactive context.
+  --check, --check-settled
+                         Run the settled-version preflight: detect managed packages with new stable
+                         releases on npm and prompt to graduate or remove dev pins. Off by default;
+                         use when you want to clean up after packages ship to public npm. Requires a TTY.
+  --skip-settled-check   Legacy no-op: settled check is skipped by default (kept for old scripts).
+  --verbose              With check-dev-registry: print clean repos, skips, and matches.
+  --all                  With check-dev-registry: check all managed packages (not only packages in dirty repos).
+  --fix                  With check-dev-registry: update mismatched package.json "version" to the registry max.
   --force-registry-publish
                          With registry apply, always run npm publish even when that exact version already
                          exists on the registry (default: skip publish to avoid E409 duplicate version).
@@ -123,6 +134,10 @@ Examples:
     --changed @metamask/utils,@metamask/keyring-api,@metamask/keyring-internal-api,@metamask/eth-snap-keyring \\
     --include @metamask/accounts-controller,@metamask/bridge-controller \\
     --scope core,snap,extension
+
+  yarn node local-registry-manager.js check-dev-registry --verbose
+  yarn node local-registry-manager.js check-dev-registry --all --fix
+  yarn node local-registry-manager.js check-dev-registry --fix --stage
 `);
 }
 
@@ -149,7 +164,10 @@ function parseArgs(argv) {
     useYarnPublish: false,
     forceRegistryPublish: false,
     fromStep: null,
-    skipSettledCheck: false,
+    skipSettledCheck: true,
+    verbose: false,
+    checkDevAll: false,
+    checkDevFix: false,
   };
 
   const positional = [];
@@ -253,8 +271,24 @@ function parseArgs(argv) {
       args.fixedDevPrerelease = true;
       continue;
     }
+    if (arg === '--check' || arg === '--check-settled') {
+      args.skipSettledCheck = false;
+      continue;
+    }
     if (arg === '--skip-settled-check') {
       args.skipSettledCheck = true;
+      continue;
+    }
+    if (arg === '--verbose') {
+      args.verbose = true;
+      continue;
+    }
+    if (arg === '--all') {
+      args.checkDevAll = true;
+      continue;
+    }
+    if (arg === '--fix') {
+      args.checkDevFix = true;
       continue;
     }
     if (arg === '--force-registry-publish') {
@@ -3114,6 +3148,58 @@ function fetchPublicNpmVersions(packageName) {
 }
 
 /**
+ * @param {string} registryUrl
+ * @param {string} packageName
+ * @returns {string[]}
+ */
+function fetchRegistryVersions(registryUrl, packageName) {
+  try {
+    const reg = shellQuotePath(registryUrl);
+    const spec = shellQuoteNpmPackageAtVersion(packageName);
+    const out = execSync(`npm view ${spec} versions --json --registry ${reg}`, {
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      shell: true,
+    });
+    const parsed = JSON.parse(out.trim());
+    if (Array.isArray(parsed)) {
+      return parsed;
+    }
+    if (typeof parsed === 'string') {
+      return [parsed];
+    }
+    return [];
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * @param {string} repoRoot
+ * @returns {boolean}
+ */
+function isGitWorkingTreeDirty(repoRoot) {
+  try {
+    execSync('git rev-parse --is-inside-work-tree', {
+      cwd: repoRoot,
+      stdio: 'ignore',
+    });
+  } catch {
+    return false;
+  }
+  try {
+    const out = execSync('git status --porcelain', {
+      cwd: repoRoot,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return String(out).trim().length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Scan every consumer dir defined in config and collect managed packages that
  * are currently pinned to a dev prerelease (x.y.z-<preid>.N).
  *
@@ -3149,29 +3235,87 @@ function findDevVersionsInSourcePackages(ctx, preid) {
  * @param {string} preid
  * @returns {string[]}
  */
+/**
+ * Check whether a package.json object contains a dev-pinned version of pkgName
+ * in any dep field or resolutions/overrides entry.
+ *
+ * @param {object} pkg      Parsed package.json
+ * @param {string} pkgName  e.g. '@metamask/keyring-api'
+ * @param {string} preid    e.g. 'dev'
+ * @returns {boolean}
+ */
+function pkgJsonHasDevPin(pkg, pkgName, preid) {
+  const depFields = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'];
+  for (const field of depFields) {
+    const version = pkg[field]?.[pkgName];
+    if (typeof version === 'string' && isDevPrerelease(version, preid)) return true;
+  }
+  for (const field of ['resolutions', 'overrides']) {
+    const res = pkg[field];
+    if (!res) continue;
+    for (const [key, version] of Object.entries(res)) {
+      if (
+        (key === pkgName || key.endsWith(`/${pkgName}`)) &&
+        typeof version === 'string' &&
+        isDevPrerelease(version, preid)
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
 function findConsumerPinsForPackage(ctx, pkgName, preid) {
-  const paths = [];
-  const depFields = ['dependencies', 'devDependencies', 'peerDependencies'];
+  // `registry apply` can write dev pins in three ways:
+  //   1. registry-pin-deps / registry-pin-consumer-deps → dep fields in consumer dirs
+  //   2. registry-sync-resolutions → `resolutions` in the workspace root (installDir)
+  //   3. registry-pin-deps on source packages → dep fields in managed publishDir packages
+  //
+  // After graduation we must clean ALL of them, not just the ones listed in
+  // consumers.dirs. We do a comprehensive scan of each consumer repo:
+  //   – explicit consumer dirs (from consumers.<group>.dirs)
+  //   – workspace root (installDir, for resolutions)
+  //   – every package under <repoRoot>/packages/  (monorepo source packages)
+
+  const found = new Set(); // absolute paths
+
+  function check(filePath) {
+    if (found.has(filePath)) return;
+    const pkg = readJson(filePath);
+    if (pkg && pkgJsonHasDevPin(pkg, pkgName, preid)) {
+      found.add(filePath);
+    }
+  }
 
   for (const consumerGroup of Object.values(ctx.config.consumers)) {
     const repoRoot = resolveRepoPath(ctx, consumerGroup.repo);
-    for (const dir of consumerGroup.dirs ?? ['.']) {
-      const absDir = path.resolve(repoRoot, dir);
-      const pkgPath = path.join(absDir, 'package.json');
-      const pkg = readJson(pkgPath);
-      if (!pkg) continue;
 
-      for (const field of depFields) {
-        const version = pkg[field]?.[pkgName];
-        if (typeof version === 'string' && isDevPrerelease(version, preid)) {
-          paths.push(pkgPath);
-          break;
+    // 1. Explicit consumer dirs
+    for (const dir of consumerGroup.dirs ?? ['.']) {
+      check(path.join(path.resolve(repoRoot, dir), 'package.json'));
+    }
+
+    // 2. Workspace root (where --sync-registry-resolutions writes)
+    const installCwd = path.resolve(repoRoot, consumerGroup.installDir ?? '.');
+    const resolutionDir = getRegistryResolutionsPackageJsonDir(installCwd);
+    if (resolutionDir) {
+      check(path.join(resolutionDir, 'package.json'));
+    }
+
+    // 3. All packages/* subdirs (handles registry-pin-deps on source packages
+    //    and any other monorepo packages that were transitively pinned)
+    const packagesDir = path.join(repoRoot, 'packages');
+    if (fs.existsSync(packagesDir)) {
+      for (const ent of fs.readdirSync(packagesDir, { withFileTypes: true })) {
+        if (ent.isDirectory()) {
+          check(path.join(packagesDir, ent.name, 'package.json'));
         }
       }
     }
   }
 
-  return paths;
+  return [...found];
 }
 
 /**
@@ -3237,13 +3381,177 @@ function promptSettledPackage(pkgName, devVersion, higherVersions) {
   const choice = promptSync(
     `  [g] Graduate consumers to ${chosenVersion}\n` +
       `  [d] Continue on dev — remove pin, rebase to pick up from main\n` +
+      `  [s] Skip — leave everything as-is for now\n` +
       `  Choice? [default: g] `,
   );
 
-  if (choice.toLowerCase() === 'd') {
+  const c = choice.toLowerCase();
+  if (c === 'd') {
     return { action: 'continue' };
   }
+  if (c === 's') {
+    return { action: 'skip' };
+  }
   return { action: 'graduate', stableVersion: chosenVersion };
+}
+
+/**
+ * Comment out a graduated package in local-registry.yml using raw text
+ * manipulation so existing formatting and unrelated comments are preserved.
+ *
+ * For each commented block a reason line is inserted above it explaining
+ * what graduated and when, so the file remains self-documenting.
+ *
+ * Two blocks are commented out:
+ *  1. The package entry under `packages:`.
+ *  2. The publishDir entry under the matching `consumers:` group dirs list.
+ *     If that leaves the consumer group with no active (non-comment) dirs,
+ *     the group header lines are commented out too.
+ *
+ * @param {string} configPath    Absolute path to local-registry.yml
+ * @param {string} pkgName       e.g. '@metamask/keyring-api'
+ * @param {string} repoKey       e.g. 'accounts'
+ * @param {string} publishDir    e.g. 'packages/keyring-api'
+ * @param {string} stableVersion e.g. '23.0.0'
+ */
+function commentOutGraduatedInConfig(configPath, pkgName, repoKey, publishDir, stableVersion) {
+  const raw = fs.readFileSync(configPath, 'utf8');
+  let lines = raw.split('\n');
+  const date = new Date().toISOString().slice(0, 10);
+
+  /** Indent length of a line. */
+  function indentOf(line) {
+    return line.length - line.trimStart().length;
+  }
+
+  /** True if a line is blank or a comment — i.e. not active YAML content. */
+  function isInert(line) {
+    return line.trim() === '' || line.trimStart().startsWith('#');
+  }
+
+  /**
+   * Comment out lines[startIdx] plus every following line whose indentation
+   * is strictly greater than the start line's indentation.
+   * Returns the index just past the last commented line.
+   */
+  function commentBlock(startIdx) {
+    const base = indentOf(lines[startIdx]);
+    let end = startIdx + 1;
+    while (end < lines.length) {
+      const l = lines[end];
+      if (isInert(l)) { end++; continue; }
+      if (indentOf(l) <= base) break;
+      end++;
+    }
+    for (let j = startIdx; j < end; j++) {
+      if (!isInert(lines[j])) {
+        lines[j] = lines[j].replace(/^(\s*)/, '$1# ');
+      }
+    }
+    return end;
+  }
+
+  // --- 1. Comment out the package block under `packages:` ---
+  const pkgKey = `"${pkgName}":`;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trimStart() === pkgKey) {
+      const pad = ' '.repeat(indentOf(lines[i]));
+      commentBlock(i);
+      lines.splice(i, 0,
+        `${pad}# Graduated ${pkgName}@${stableVersion} on ${date}: settled on public npm,`,
+        `${pad}# no longer needs local publishing.`,
+      );
+      break;
+    }
+  }
+
+  // --- 2. Comment out the publishDir entry in `consumers:` dirs ---
+  const dirEntry = `- ${publishDir}`;
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i].trimStart() !== dirEntry) continue;
+
+    const pad = ' '.repeat(indentOf(lines[i]));
+    lines[i] = lines[i].replace(/^(\s*)/, '$1# ');
+    lines.splice(i, 0,
+      `${pad}# Graduated ${pkgName}@${stableVersion} on ${date}: dir no longer`,
+      `${pad}# needs local yarn/build.`,
+    );
+
+    // --- 3. If no active dirs remain in this consumer group, comment out
+    //        the entire group (name key + repo/installDir/dirs metadata). ---
+    const dirIndent = pad.length;
+
+    // Walk back to find `dirs:` key.
+    let dirsKeyIdx = -1;
+    for (let j = i - 1; j >= 0; j--) {
+      if (isInert(lines[j])) continue;
+      if (lines[j].trimStart() === 'dirs:') { dirsKeyIdx = j; break; }
+      if (indentOf(lines[j]) < dirIndent) break;
+    }
+
+    if (dirsKeyIdx !== -1) {
+      const dirsIndent = indentOf(lines[dirsKeyIdx]);
+      let hasActiveDirs = false;
+      for (let j = dirsKeyIdx + 1; j < lines.length; j++) {
+        if (isInert(lines[j])) continue;
+        if (indentOf(lines[j]) <= dirsIndent) break;
+        hasActiveDirs = true;
+        break;
+      }
+
+      if (!hasActiveDirs) {
+        // Walk back from `dirs:` to find the group name line — the first line
+        // with indent strictly less than the group properties' indent.
+        const propIndent = dirsIndent; // e.g. 4
+        let groupNameIdx = -1;
+        for (let j = dirsKeyIdx - 1; j >= 0; j--) {
+          if (isInert(lines[j])) continue;
+          if (indentOf(lines[j]) < propIndent) { groupNameIdx = j; break; }
+        }
+        if (groupNameIdx !== -1) {
+          const groupPad = ' '.repeat(indentOf(lines[groupNameIdx]));
+          commentBlock(groupNameIdx);
+          lines.splice(groupNameIdx, 0,
+            `${groupPad}# All packages in this consumer group have graduated — no active dirs remain.`,
+          );
+        }
+      }
+    }
+    break;
+  }
+
+  // --- 4. If no active package still references repoKey, comment out the
+  //        repo entry in `repos:` ---
+  const repoLineEntry = `${repoKey}:`;
+  let repoStillNeeded = false;
+  const pkgKeyPattern = /^\s+"[^"]+":$/;
+  let inPackages = false;
+  for (const l of lines) {
+    if (l.trim() === 'packages:') { inPackages = true; continue; }
+    if (inPackages && /^\S/.test(l) && l.trim() !== 'packages:') { inPackages = false; }
+    if (!inPackages) continue;
+    if (isInert(l)) continue;
+    if (pkgKeyPattern.test(l)) continue; // package name line
+    if (l.trimStart().startsWith(`repo: ${repoKey}`)) { repoStillNeeded = true; break; }
+  }
+
+  if (!repoStillNeeded) {
+    // Match `  accounts: ../accounts` — note the trailing space distinguishes
+    // a repos entry (has a path value) from a consumer group name (`accounts:`).
+    const repoEntryPrefix = `${repoKey}: `;
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i].trimStart().startsWith(repoEntryPrefix)) {
+        const pad = ' '.repeat(indentOf(lines[i]));
+        lines[i] = lines[i].replace(/^(\s*)/, '$1# ');
+        lines.splice(i, 0,
+          `${pad}# Repo ${repoKey} graduated on ${date}: no active packages reference it anymore.`,
+        );
+        break;
+      }
+    }
+  }
+
+  fs.writeFileSync(configPath, lines.join('\n'), 'utf8');
 }
 
 /**
@@ -3257,12 +3565,15 @@ function promptSettledPackage(pkgName, devVersion, higherVersions) {
  * @param {boolean} dryRun
  */
 function applySettledPinChange(pkgName, pkgJsonPaths, newVersion, dryRun) {
-  const depFields = ['dependencies', 'devDependencies', 'peerDependencies'];
+  const depFields = ['dependencies', 'devDependencies', 'peerDependencies', 'optionalDependencies'];
+  const resolutionFields = ['resolutions', 'overrides'];
   for (const pkgPath of pkgJsonPaths) {
     const pkg = readJson(pkgPath);
     if (!pkg) continue;
 
     let changed = false;
+
+    // Update or remove the dev pin in direct dependency fields.
     for (const field of depFields) {
       if (pkg[field]?.[pkgName] !== undefined) {
         if (newVersion === null) {
@@ -3271,6 +3582,30 @@ function applySettledPinChange(pkgName, pkgJsonPaths, newVersion, dryRun) {
           pkg[field][pkgName] = newVersion;
         }
         changed = true;
+      }
+    }
+
+    // Remove the dev pin from resolutions/overrides regardless of action.
+    //
+    // For graduation: the stable version resolves normally from public npm,
+    //   so the forced override is no longer needed.
+    // For continue-on-dev: we're removing the pin entirely so a rebase from
+    //   main can provide the correct version without a merge conflict.
+    //
+    // Handles both exact keys ("@scope/pkg") and selective resolutions
+    // ("parent/@scope/pkg").
+    for (const field of resolutionFields) {
+      const res = pkg[field];
+      if (!res) continue;
+      for (const key of Object.keys(res)) {
+        if (key === pkgName || key.endsWith(`/${pkgName}`)) {
+          delete res[key];
+          changed = true;
+        }
+      }
+      // Remove the field entirely if it's now empty.
+      if (Object.keys(res).length === 0) {
+        delete pkg[field];
       }
     }
 
@@ -3289,12 +3624,13 @@ function applySettledPinChange(pkgName, pkgJsonPaths, newVersion, dryRun) {
 }
 
 /**
- * Pre-flight check run at the start of `registry apply`.
+ * Pre-flight check run at the start of `registry apply` when the user passes
+ * `--check` or `--check-settled` (off by default).
  * Scans consumer pins, checks public npm for settled versions, and
  * interactively asks the user to graduate or continue for each one.
  *
- * Skipped entirely when --dry-run (prints a report instead) or when
- * stdin is not a TTY (CI safety).
+ * With --dry-run, prints a report instead of prompting. Without a TTY, fails
+ * so non-interactive runs do not silently skip graduation choices.
  *
  * @param {{ config: object, baseDir: string }} ctx
  * @param {{ preid: string, dryRun: boolean }} args
@@ -3308,7 +3644,7 @@ function runSettledPreflight(ctx, args) {
       section('Settled-version check');
       info('No managed packages are currently at a dev prerelease version — nothing to check.');
     }
-    return;
+    return { graduated: [] };
   }
 
   section('Settled-version check');
@@ -3334,25 +3670,28 @@ function runSettledPreflight(ctx, args) {
     if (settled.length > 0) {
       info('(dry-run: re-run without --dry-run to act on settled packages)');
     }
-    return;
+    return { graduated: [] };
   }
 
-  if (settled.length === 0) return;
+  if (settled.length === 0) {
+    return { graduated: [] };
+  }
 
   // Guard before prompting: verify /dev/tty is readable so we never silently
   // apply a default action when running non-interactively (e.g. piped CI runs).
   try {
     fs.accessSync('/dev/tty', fs.constants.R_OK);
   } catch {
-    info(
-      `  /dev/tty is not accessible — cannot prompt interactively.\n` +
-      `  Pass --skip-settled-check to suppress this check, or run without piping stdin.`,
+    fail(
+      `/dev/tty is not accessible — cannot prompt interactively for settled packages.\n` +
+        `Run from a real terminal, or omit --check / --check-settled so this preflight is skipped.`,
     );
-    return;
   }
 
   info();
   info(`${settled.length} package(s) have settled — please choose an action for each:`);
+
+  const graduated = [];
 
   for (const { pkgName, devVersion, dirs, higher } of settled) {
     const decision = promptSettledPackage(pkgName, devVersion, higher);
@@ -3360,16 +3699,25 @@ function runSettledPreflight(ctx, args) {
     if (decision.action === 'graduate') {
       info(`  → Graduating ${pkgName}: pinning consumers to ${decision.stableVersion}`);
       applySettledPinChange(pkgName, dirs, decision.stableVersion, false);
+      const pkgMeta = ctx.config.packages[pkgName];
+      commentOutGraduatedInConfig(ctx.configPath, pkgName, pkgMeta.repo, pkgMeta.publishDir, decision.stableVersion);
+      info(`  → Commented out ${pkgName} in ${path.basename(ctx.configPath)}`);
+      graduated.push(pkgName);
     } else if (decision.action === 'continue') {
       info(`  → Removing dev pin for ${pkgName} from consumers. Rebase your branch — the version will come from main.`);
       applySettledPinChange(pkgName, dirs, null, false);
+    } else if (decision.action === 'skip') {
+      info(`  → Skipping ${pkgName} — no changes made.`);
     } else {
       // promptSync returned '' — /dev/tty not readable, bail out safely
-      info(`  → Could not read input for ${pkgName} — skipping (pass --skip-settled-check to suppress).`);
+      info(
+        `  → Could not read input for ${pkgName} — skipping this package (re-run with a TTY or omit --check).`,
+      );
     }
   }
 
   info();
+  return { graduated };
 }
 
 function registryApplyCommand(args) {
@@ -3390,7 +3738,30 @@ function registryApplyCommand(args) {
   assertKnownPackages(ctx.config, args.changed, 'changed packages');
 
   if (!args.skipSettledCheck) {
-    runSettledPreflight(ctx, args);
+    const { graduated } = runSettledPreflight(ctx, args);
+    if (graduated.length > 0) {
+      const remaining = args.changed.filter((p) => !graduated.includes(p));
+      info('');
+      info('┌─────────────────────────────────────────────────────────────────┐');
+      info('│  Graduated packages were removed from local-registry.yml.       │');
+      info('│  The apply plan has NOT been run — update --changed and re-run. │');
+      info('└─────────────────────────────────────────────────────────────────┘');
+      info('');
+      info(`  Graduated (remove from --changed):`);
+      for (const p of graduated) {
+        info(`    - ${p}`);
+      }
+      if (remaining.length > 0) {
+        info('');
+        info(`  Suggested --changed for your next run:`);
+        info(`    --changed ${remaining.join(',')}`);
+      } else {
+        info('');
+        info('  All changed packages have graduated — nothing left to apply.');
+      }
+      info('');
+      process.exit(0);
+    }
   }
 
   let plan = buildApplyPlan(ctx.config, args.changed, args.include);
@@ -3597,6 +3968,165 @@ function buildCleanCommands(ctx, dirs) {
   return commands;
 }
 
+/**
+ * @param {object} args
+ */
+function checkDevRegistryCommand(args) {
+  if (args.fromStep != null) {
+    fail('--from-step is only supported for apply and registry apply');
+  }
+  if (args.checkDevFix && args.dryRun) {
+    fail('--fix cannot be combined with --dry-run');
+  }
+  const ctx = loadConfig(args.config);
+  const registryUrl =
+    args.registryUrl ?? ctx.config.registry ?? 'http://localhost:4873';
+  const preid = args.preid;
+
+  /** @type {Set<string>} */
+  const dirtyRepoKeys = new Set();
+  for (const repoKey of Object.keys(ctx.config.repos)) {
+    const rel = ctx.config.repos[repoKey];
+    if (typeof rel !== 'string' || !rel.trim()) {
+      continue;
+    }
+    const repoRoot = resolveRepoPath(ctx, repoKey);
+    if (!fs.existsSync(repoRoot)) {
+      if (args.verbose) {
+        info(`repo ${repoKey}: skip (missing path ${repoRoot})`);
+      }
+      continue;
+    }
+    const dirty = isGitWorkingTreeDirty(repoRoot);
+    if (args.verbose) {
+      info(`repo ${repoKey}: ${dirty ? 'dirty' : 'clean'} (${repoRoot})`);
+    }
+    if (dirty) {
+      dirtyRepoKeys.add(repoKey);
+    }
+  }
+
+  if (!args.checkDevAll && dirtyRepoKeys.size === 0) {
+    section('check-dev-registry');
+    info(
+      'No dirty repos under `repos:` (git status clean). Use --all to check every managed package.',
+    );
+    return;
+  }
+
+  section('check-dev-registry');
+  info(`registry: ${registryUrl}`);
+  info(`preid: ${preid}`);
+  if (!args.checkDevAll) {
+    info(`dirty repos: ${[...dirtyRepoKeys].sort().join(', ')}`);
+  } else {
+    info('scope: all managed packages (--all)');
+  }
+  if (args.checkDevFix) {
+    info(`fix: ${args.stage ? 'write package.json + git add' : 'write package.json'} when behind registry`);
+  }
+
+  let blockingIssues = 0;
+  let mismatchWithoutFix = 0;
+  let fixedCount = 0;
+
+  for (const [pkgName, pkgMeta] of Object.entries(ctx.config.packages)) {
+    if (!args.checkDevAll && !dirtyRepoKeys.has(pkgMeta.repo)) {
+      continue;
+    }
+    const repoRoot = resolveRepoPath(ctx, pkgMeta.repo);
+    const pkgPath = path.join(repoRoot, pkgMeta.publishDir, 'package.json');
+    if (!fs.existsSync(pkgPath)) {
+      blockingIssues += 1;
+      subSection(pkgName);
+      info(`  missing package.json: ${pkgPath}`);
+      info(`  hint: fix publishDir / repo path in ${args.config}`);
+      continue;
+    }
+    const pkg = readJson(pkgPath);
+    const version = pkg?.version;
+    if (!version) {
+      blockingIssues += 1;
+      subSection(pkgName);
+      info(`  no version in ${pkgPath}`);
+      continue;
+    }
+    if (!isDevPrerelease(version, preid)) {
+      if (args.verbose) {
+        subSection(pkgName);
+        info(`  ${version} (skipped: not *-${preid}.* prerelease)`);
+      }
+      continue;
+    }
+
+    const published = fetchRegistryVersions(registryUrl, pkgName);
+    const latest = latestPreidPrereleaseOnReleaseLine(
+      published,
+      version,
+      preid,
+    );
+
+    if (latest === null) {
+      blockingIssues += 1;
+      subSection(pkgName);
+      info(`  package.json: ${version}`);
+      info(
+        `  hint: no *-${preid}.* on ${registryUrl} for this release line (publish a dev build or fix registry)`,
+      );
+      continue;
+    }
+    if (version === latest) {
+      if (args.verbose) {
+        subSection(pkgName);
+        info(`  ${version} (matches registry)`);
+      }
+      continue;
+    }
+
+    if (args.checkDevFix) {
+      pkg.version = latest;
+      writeJson(pkgPath, pkg);
+      fixedCount += 1;
+      subSection(pkgName);
+      info(`  fixed: ${version} -> ${latest}`);
+      info(`  wrote ${pkgPath}`);
+      if (args.stage) {
+        const rel = path.relative(repoRoot, pkgPath);
+        execSync(`git add ${shellQuotePath(rel)}`, {
+          cwd: repoRoot,
+          stdio: 'inherit',
+          shell: true,
+        });
+      }
+      continue;
+    }
+
+    mismatchWithoutFix += 1;
+    subSection(pkgName);
+    info(`  package.json: ${version}`);
+    info(`  registry max on same line: ${latest}`);
+    info(`  hint: set "version" to "${latest}" in ${pkgPath}`);
+    info(`  hint: or run with --fix`);
+  }
+
+  section('Summary');
+  if (fixedCount > 0) {
+    info(`fixed: ${fixedCount} package(s)`);
+  }
+  if (blockingIssues > 0) {
+    info(`blocking issues: ${blockingIssues}`);
+  }
+  if (mismatchWithoutFix > 0) {
+    info(`mismatches (re-run with --fix): ${mismatchWithoutFix}`);
+  }
+  if (blockingIssues === 0 && mismatchWithoutFix === 0 && fixedCount === 0) {
+    info('all checked dev versions match the registry (or nothing to check).');
+  }
+  if (blockingIssues > 0 || mismatchWithoutFix > 0) {
+    process.exitCode = 1;
+  }
+}
+
 function cleanCommand(args) {
   if (args.fromStep != null && args.fromStep > 1) {
     fail('--from-step is only supported for apply and registry apply');
@@ -3638,6 +4168,9 @@ function main() {
       break;
     case 'registry-clean':
       registryCleanCommand(args);
+      break;
+    case 'check-dev-registry':
+      checkDevRegistryCommand(args);
       break;
     default:
       fail(`Unknown command: ${args.command}`);
